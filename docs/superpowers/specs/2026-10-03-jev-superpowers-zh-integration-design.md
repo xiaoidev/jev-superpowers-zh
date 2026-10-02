@@ -25,6 +25,7 @@
 | 3 | 命名分发 | npm 包名 `jev-superpowers-zh`，CLI 短名 `jevzh`；技能目录保留英文 slug（含 `jev-` 前缀），正文中文 |
 | 4 | 首期范围 | 最小可发布版：27 技能 + 安装器 + 钩子 + 文档 + 测试；不含站点/CI/发版流水线 |
 | 5 | 配置机制 | `.jevzh.json` + 环境变量双通道，`backend: auto` 本地 Laya 桥优先 |
+| 6 | 与已装竞品的兼容 | 技能同名零覆盖仅补缺；router/hook 默认备份后自动接管；plugin 形态硬阻断不可绕过；备份可 restore（详见 §7.7） |
 
 ## 2. 总体架构
 
@@ -82,7 +83,8 @@ jev-superpowers-zh/
 │   ├── jev-gate.md              # 【新增】门禁机制、配置、故障排查
 │   ├── FOSS_LAYA.zh.md          # 译自 jev FOSS_LAYA.md（本地部署，国内核心场景）
 │   └── CONFIDENCE.zh.md         # 译自 jev CONFIDENCE.md（置信度阈值策略）
-├── tests/                       # zh 测试套品牌化 + 新增 tests/jev-gate/
+├── tests/                       # zh 测试套品牌化 + 新增 tests/jev-gate/、tests/coexistence/
+├── .gitignore                   # 含 .jevzh/、node_modules/
 ├── .jevzh.json.example          # 配置模板（实际配置由安装器生成，不入库）
 ├── .upstream-sync.json          # 扩展为双源（zh + jev）
 ├── .claude-plugin/ .cursor-plugin/ .codex-plugin/ .kimi-plugin/
@@ -92,6 +94,8 @@ jev-superpowers-zh/
 ├── README.md  RELEASE-NOTES.zh.md  LICENSE
 └── .github/                     # 仅保留 issue 模板；workflows 属二期，首期不迁
 ```
+
+运行时（不入库）：`.jevzh/backups/<时间戳>/`（安装接管前的备份，见 §7.7）、系统临时目录 `jevzh-<项目hash>.state`（就绪缓存，见 §5.2）。
 
 **首期明确不迁入**：
 
@@ -237,10 +241,85 @@ fork superpowers-zh 的 `bin/superpowers-zh.js`（1799 行，TARGETS 26 工具�
    - `--no-jev`：仅安装 21 个标准技能，不复制门禁钩子、不生成 `.jevzh.json`；
    - `--strict`：生成 `strict: true` 的 `.jevzh.json`；
    - 默认：安装全部 27 技能 + 钩子（按目标能力）+ 生成默认 `.jevzh.json`（已存在则不覆盖）；
+   - 共存迁移相关开关 `--adopt-skills` / `--keep-router` / `--detect-only` 与 `doctor` / `restore` 子命令见 §7.7；
 3. **安装末就绪报告**：跑一次 Node 版就绪探测（与 jev-readiness 同口径，/health 2s 超时），打印中文门禁状态报告（FULL/LOCAL/PARTIAL/DEGRADED、缺失工具及安装命令）；
 4. **钩子与引导**：按 TARGETS 能力决定是否复制 hooks；各工具 bootstrap 指向 `jev-using-superpowers` 路由；
 5. **计数口径**：工具数仍断言 26（jev 层是同一包内能力，不新增「工具」口径）；
 6. `package.json`：`name: jev-superpowers-zh`、`bin: { "jevzh": "bin/jevzh.js" }`，`files` 清单加入 jev 钩子/scripts/docs，发布前需 `npm view jev-superpowers-zh` 确认包名未被占用。
+
+### 7.7 与已装竞品的共存、迁移与稳定性
+
+安装时机器上可能已存在 **obra/superpowers 原版**、**superpowers-zh**、**jev-superpowers**。zh 安装器现状是 `copyDirSync` 静默合并覆盖、无检测、无备份、无回滚——不能直接沿用。
+
+**设计原则（用户已确认的策略）**：
+
+1. **技能文件共存、仅补缺**：同名技能目录默认**跳过不覆盖**，只安装目标缺失的技能；
+2. **会话入口唯一**：router（bootstrap 路由段 / SessionStart 注入 / pre-commit、stop 硬钩子）一个会话只能有一个生效，检测到竞品占用时**默认备份后自动接管**；
+3. **plugin 形态硬阻断**：插件目录不在文件级安装器管辖内，任何开关不可绕过；
+4. **全程可回滚、非交互友好、不动用户无关内容**。
+
+#### 7.7.1 预检（preflight）
+
+安装主流程写盘前先预检当前安装范围（`--tool` 指定目标或自动检测到的全部目标；项目级查项目目录、全局查 home）：
+
+| 检测对象 | 识别方式 |
+|---|---|
+| 竞品技能目录 | 目标 skills 目录中命中 27 名单的目录，按**来源识别**分类（见 7.7.2） |
+| bootstrap 路由段 | zh 新旧哨兵（`<!-- superpowers-zh:begin/end -->`、`# Superpowers-ZH` 固定标记 + FALLBACK 尾句）、obra 无哨兵段（特征短语）、jev 无 bootstrap（install.sh 只 cp 技能，但若存在引用 jev-using-superpowers 的段同样识别） |
+| hooks 占用 | `.claude/settings.json` / `settings.local.json`、Cursor 配置中已有的 SessionStart/PreToolUse/Stop 条目，特别是 jev 上游 `pre-commit`/`stop` 路径引用 |
+| plugin 形态 | 各工具插件配置中已启用的 superpowers / superpowers-zh / jev-superpowers（Claude Code marketplace、Cursor plugin 等） |
+| npm 全局包 | best-effort 探测 `superpowers-zh`（及未来 `jev-superpowers-zh` 自身旧版） |
+| 既有配置 | 项目根 `.jevzh.json`、`TYPESAFE_*` 环境变量（共享资产，不动） |
+
+预检报告分级：**BLOCK**（必须中止）/ **MIGRATE**（将自动接管项）/ **SKIP**（同名跳过项，注明来源与行为差异）/ **ADD**（补缺项）/ **WARN**（npm 包共存、项目级与全局副本交叉的生效优先级说明）。退出码：0 成功，2 存在 BLOCK，1 其他错误。
+
+#### 7.7.2 同名技能的来源识别与处置
+
+逐个同名目录读 frontmatter/正文特征判定：
+
+- **本包旧版**：含 jev-superpowers-zh 品牌串，或目录内有本包写入的 `.jevzh-meta.json`（安装时随技能写入，字段：pkg、version、date、scope、target，合法 JSON 以便通过 audit 的 JSON 校验）→ 视为**自升级**，默认覆盖（不属竞品冲突）；
+- **superpowers-zh**：含「本节是 superpowers-zh 的增量内容」或 zh 品牌串 → 跳过（与 jevzh 底座同源同版本，行为基本等价，差异仅品牌与路由）；
+- **jev-superpowers**：`jev-*` 正文含英文 `TypeSafe Jev` / `Failure Modes` / 引用 `docs/CONFIDENCE.md` → 跳过并**显著标红**：该同名技能是英文**硬 STOP** 旧版，软降级语义不会生效，可用 `--adopt-skills` 接管；
+- **obra 原版**：英文正文 + `superpowers:` 前缀引用特征 → 跳过并标红：英文旧版不会路由到中文/jev 技能；
+- **无法识别**（用户自建同名目录）：按用户内容处理——跳过 + WARN，**绝不覆盖**。
+
+补缺安装的技能照常写入 `.jevzh-meta.json`。
+
+#### 7.7.3 处置矩阵
+
+| 冲突对象 | 默认处置 | 可覆盖默认的开关 |
+|---|---|---|
+| plugin 形态任一竞品启用 | **BLOCK 中止**，打印对应卸载命令（如 `claude plugin uninstall superpowers-zh@superpowers-zh`） | 无（`--force` 也不绕过） |
+| 竞品同名技能目录 | SKIP（不覆盖），来源入报告 | `--adopt-skills`：备份后覆盖同名技能（完整替代） |
+| 目标缺失的名单内技能 | ADD（补缺，含 4 个 chinese-*、6 个汉化 jev-* 等） | — |
+| 本包旧版技能（带 meta 标记） | 覆盖（自升级） | — |
+| bootstrap 路由段 | MIGRATE：备份整文件 → 切除旧段（zh 哨兵精确切除；无哨兵段按特征边界切除，保留用户其他内容）→ 写入 jevzh 哨兵段 | `--keep-router`：不动旧段（接受新技能可能不可达，由 doctor 持续提示） |
+| hooks 配置 | MIGRATE：**读改写合并**而非覆盖——保留用户既有 hook 条目，追加 jevzh 条目；已有的 jev 上游 pre-commit/stop 引用改为指向 jevzh 钩子（不重复追加）；改前整文件备份 | `--keep-router` |
+| npm 全局 `superpowers-zh` | WARN：CLI 名不同（`superpowers-zh` vs `jevzh`）可共存，建议卸载避免误用 | — |
+| 旧 `.jevzh.json` | 不覆盖；schema 缺字段时补默认值并报告 | — |
+| 外部 jev 二进制工具链、`TYPESAFE_*` env | 共享资产，不动 | — |
+
+#### 7.7.4 备份、事务与回滚
+
+- 备份根：项目级安装 → `<项目>/.jevzh/backups/<时间戳>/`；全局安装 → `~/.jevzh/backups/<时间戳>/`；按目标工具分目录。`.jevzh/` 写入 `.gitignore`；
+- 备份内容：被接管的 bootstrap 文件整份、被修改的 hooks/settings 文件整份、切除段的原文与位置、`--adopt-skills` 时被覆盖的技能目录；纯补缺/跳过不产生备份；
+- **按目标工具一个事务**：暂存 → 备份 → 写技能/改段/合并 hooks → 校验（技能数非空、settings JSON 仍可 parse、哨兵成对存在）→ 任一步失败则从备份恢复该目标（已完成的其他目标不回滚，报告已完成项）；
+- 备份轮转保留最近 3 份，更旧的自动清除；
+- `jevzh restore <时间戳>`：从指定备份恢复对应文件/目录（手工触发；卸载不自动恢复）。
+
+#### 7.7.5 CLI 开关与 `doctor`
+
+- 默认（无开关）：补缺技能 + router/hook 备份后自动接管；
+- `--no-jev` / `--strict`：见 7.7 之前的安装器设计；
+- `--adopt-skills`：同名竞品技能也备份后覆盖（完整替代语义）；
+- `--keep-router`：纯补缺，不接管 router/hook；
+- `--detect-only`：只跑预检出报告，不写盘（供 CI/先评估）；
+- `--force`：语义沿用 zh（主目录/系统目录护栏），**对 plugin BLOCK 无效**；
+- `jevzh doctor`（新子命令）：展示当前安装范围内——检测到的竞品痕迹与来源、**当前实际生效的 router 属于哪一套**、同名 SKIP 残留清单及预期行为差异、hooks 接线状态、门禁就绪四态（复用 jev-readiness）、备份清单与 restore 命令。
+
+#### 7.7.6 与 26 工具的关系
+
+预检/接管只处理当前安装范围涉及的目标；router/hook 接管仅对具备 bootstrap/hook 机制的工具执行（Claude Code、Cursor 及安装器 TARGETS 中已有 bootstrap 生成器的工具），其余 24 款工具只做技能补缺，并在报告与 `doctor` 中提示其门禁靠技能正文手动步骤、不存在 router 冲突。
 
 ## 8. 质量设施
 
@@ -279,7 +358,8 @@ fork superpowers-zh 的 `bin/superpowers-zh.js`（1799 行，TARGETS 26 工具�
 
 `declaredDivergences` 中的文件只跑欠同步 **warn**（人工评估是否跟上游新版本），不跑逐字一致 FAIL。
 
-5. **计数与删除项**：技能总数 21→27 的文案断言同步更新；删除针对 `site/build.mjs` 的全部计数检查与 npm 发布一致性检查（首期不迁站点、不发包）；Category 2 安装器矩阵新增 `--no-jev`、`--strict` 装/卸载用例，工具数仍断言 26。
+5. **计数与删除项**：技能总数由 21 增至 27 的文案断言同步更新；删除针对 `site/build.mjs` 的全部计数检查与 npm 发布一致性检查（首期不迁站点、不发包）；Category 2 安装器矩阵新增 `--no-jev`、`--strict` 装/卸载用例，工具数仍断言 26；
+6. **新增共存能力静态检查**：安装器中必须存在 preflight、doctor、restore、`--adopt-skills`、`--keep-router`、`--detect-only` 标识（缺失即 FAIL，防止开关被删而文档仍宣称）；仓库 `.gitignore` 必须含 `.jevzh/`；仓库内任何技能目录不得误入 `.jevzh-meta.json`（那是安装期生成物，仅出现在用户目标目录）。
 
 ### 8.2 测试策略（全部离线可跑）
 
@@ -292,11 +372,21 @@ fork superpowers-zh 的 `bin/superpowers-zh.js`（1799 行，TARGETS 26 工具�
   5. **每会话一次提示**：state 文件 `notified` 翻转行为；
   6. **契约保真单测**：与 8.1-3 同源的 grep 断言，提供不依赖 upstream remote 的快速反馈；
   7. **桥冒烟**：起 heuristic 模式，`GET /health` 返回 200 且可识别 `laya_installed:false`；
+- 新增 `tests/coexistence/`（Node，直接驱动安装器函数/CLI，临时 HOME + 临时项目目录夹具）：
+  1. **四套前置场景**：分别预置 obra 风格英文技能集、superpowers-zh 21 技能+新旧哨兵、jev-superpowers 17 技能于 `~/.agents/skills`、伪造的 plugin 启用记录；
+  2. **仅补缺断言**：同名竞品技能内容 hash/mtime 不变；缺失技能（chinese-* 等）被补入且带 `.jevzh-meta.json`；补缺技能可被第二次安装幂等处理；
+  3. **router 自动接管**：旧 bootstrap 段被备份且替换为 jevzh 哨兵段，用户自有段落保留；settings hooks 数组合并后用户既有条目仍在、jev 硬钩子引用被改写而非重复；
+  4. **plugin BLOCK**：启用记录存在时退出码 2，`--force` 仍 2，目标目录零写入；
+  5. **开关矩阵**：`--adopt-skills` 覆盖同名技能且备份可查；`--keep-router` 下旧段不动；`--detect-only` 零写盘；
+  6. **来源识别**：本包旧版（带 meta）被升级覆盖；来源不明的同名用户目录被跳过且报告 WARN；
+  7. **事务回滚**：人为令 hooks 合并后校验失败（注入坏 JSON 场景），断言该目标恢复到备份、报告列出已完成的其他目标；
+  8. **restore**：`jevzh restore <ts>` 还原 bootstrap/settings/技能至安装前；备份轮转只保留 3 份；
+  9. **doctor 输出**：router 归属、SKIP 残留、hooks 状态与就绪四态齐备；
 - 不做：真实 TypeSafe 云调用、421M 模型下载集成测试、Windows 原生 CI（二期）；本地以 run-hook.cmd + Git Bash 覆盖 Windows 路径。
 
 ## 9. 文档
 
-- **README.md（中文主，重写）**：定位；与 obra / jnMetaCode / Akash 三方关系与差异；27 技能表；双后端与软降级说明；快速开始（首期 `npm install -g .` 或 `npm link` 后 `jevzh`；npm 公开发布占位）；配置与严格模式；26 工具支持表含「钩子能力」列；卸载（含旧 superpowers-zh 哨兵清理）；质量审计；贡献；归属；
+- **README.md（中文主，重写）**：定位；与 obra / jnMetaCode / Akash 三方关系与差异；27 技能表；双后端与软降级说明；快速开始（首期 `npm install -g .` 或 `npm link` 后 `jevzh`；npm 公开发布占位）；配置与严格模式；26 工具支持表含「钩子能力」列；**与已装 superpowers / superpowers-zh / jev-superpowers 的共存与迁移**（仅补缺、router 备份接管、plugin 先卸载、`--adopt-skills` / `--keep-router` / `--detect-only` / `doctor` / `restore` 用法、备份位置）；卸载（含旧 superpowers-zh 哨兵清理）；质量审计；贡献；归属；
 - **docs/jev-gate.md（新增）**：门禁机制、两类失败、配置项、四态含义、各工具钩子支持矩阵、故障排查；
 - **docs/CONFIDENCE.zh.md（译）**：阈值表带原文数字对照，数字不改；
 - **docs/FOSS_LAYA.zh.md（译 + 增补）**：本地部署、pip 国内镜像、heuristic 模式能力边界；
@@ -316,8 +406,9 @@ fork superpowers-zh 的 `bin/superpowers-zh.js`（1799 行，TARGETS 26 工具�
 1. `bash scripts/audit.sh --quick --no-upstream` 全绿（FAIL=0）；
 2. `tests/jev-gate/` 全部通过（Git Bash）；迁入的 zh 测试套通过；
 3. `jevzh` 安装器对 claude / cursor / trae 三类目标在临时目录完成 安装 → 幂等重装 → 卸载；`--no-jev` 只落 21 技能；`--strict` 生成 strict 配置；
-4. README 与 docs 无死链；LICENSE 为 MIT 且三方归属齐备；
-5. 6 个 jev 技能契约保真检查通过。
+4. `tests/coexistence/` 九类用例全部通过：obra / superpowers-zh / jev-superpowers 三套前置场景下同名技能零覆盖仅补缺、router/hook 备份后接管且可 restore、plugin 形态阻断（exit 2、`--force` 不绕过、零写入）、`--adopt-skills` 完整替代、事务失败回滚；
+5. README 与 docs 无死链；LICENSE 为 MIT 且三方归属齐备；
+6. 6 个 jev 技能契约保真检查通过。
 
 ## 12. 非目标（首期技术债登记）
 
@@ -337,3 +428,5 @@ fork superpowers-zh 的 `bin/superpowers-zh.js`（1799 行，TARGETS 26 工具�
 | 汉化误改门禁命令/阈值 | audit jev 契约保真检查 + tests/jev-gate 契约单测双保险 |
 | 双上游演进导致漂移 | `.upstream-sync.json` 双基线 + audit 欠同步 warn；二期做同步脚本 |
 | 软降级被误认为「门已通过」 | 每会话醒目提示一次 + 判定型失败永不软放行 + state 中记录降级原因 |
+| 与已装三套竞品混装导致双 router/双注入、旧硬 STOP 版残留 | 安装前 preflight 分级；plugin 形态硬阻断；router/hook 备份后接管（事务+restore）；同名技能仅补缺并由 doctor 明示差异；`--adopt-skills` 提供完整替代 |
+| router 自动接管改变用户现有会话行为 | 接管前整文件备份、轮转 3 份、`jevzh restore` 一键回滚；安装报告逐项列出 MIGRATE 内容；`--keep-router` 提供不改入口的纯补缺 |
