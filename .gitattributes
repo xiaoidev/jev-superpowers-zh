@@ -1,0 +1,24 @@
+# Scripts and docs are always LF, even on Windows checkouts.
+
+# Shell scripts and extensionless entry scripts shipped with skills
+*.sh text eol=lf
+skills/*/scripts/* text eol=lf
+
+# Documentation
+*.md text eol=lf
+
+# Source and config files
+*.json text eol=lf
+*.example text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.ts text eol=lf
+*.html text eol=lf
+*.svg text eol=lf
+*.dot text eol=lf
+
+# Root text files without an extension
+LICENSE text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf

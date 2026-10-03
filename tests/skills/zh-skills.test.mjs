@@ -1,9 +1,17 @@
 import assert from "node:assert/strict";
+import { execSync } from "node:child_process";
 import fs from "node:fs";
 import test from "node:test";
+import { fileURLToPath } from "node:url";
 
 const root = new URL("../../", import.meta.url);
+const repoRoot = fileURLToPath(root);
 const skillsRoot = new URL("skills/", root);
+
+// Normalize CRLF so a fresh Windows checkout (core.autocrlf=true) does not
+// break regexes that rely on LF semantics.
+const readText = (path) =>
+  fs.readFileSync(path, "utf8").replace(/\r\n/g, "\n");
 
 const expected = [
   "brainstorming",
@@ -29,11 +37,24 @@ const expected = [
   "workflow-runner",
 ];
 
+// Upstream ships these scripts with mode 100755. The git index bit is the
+// source of truth because Windows checkouts have no filesystem exec bit.
+const executableScripts = [
+  "skills/brainstorming/scripts/start-server.sh",
+  "skills/brainstorming/scripts/stop-server.sh",
+  "skills/executing-plans/scripts/task-start",
+  "skills/executing-plans/scripts/task-done",
+  "skills/subagent-driven-development/scripts/task-brief",
+  "skills/subagent-driven-development/scripts/sdd-workspace",
+  "skills/subagent-driven-development/scripts/review-package",
+  "skills/systematic-debugging/find-polluter.sh",
+];
+
 test("all zh skills have frontmatter and no jev calls", () => {
   for (const name of expected) {
     const file = new URL(`skills/${name}/SKILL.md`, root);
     assert.ok(fs.existsSync(file), `skills/${name}/SKILL.md`);
-    const text = fs.readFileSync(file, "utf8");
+    const text = readText(file);
     assert.match(text, /^---\nname:/, `${name}: frontmatter start`);
     assert.match(text, /^name: /m, `${name}: name field`);
     assert.match(text, /^description:/m, `${name}: description field`);
@@ -45,10 +66,14 @@ test("all zh skills have frontmatter and no jev calls", () => {
       `${name}: no jev tooling in the zh skill base`,
     );
   }
-  assert.equal(expected.length, 21);
+  assert.equal(
+    new Set(expected).size,
+    expected.length,
+    "expected skill list must not contain duplicates",
+  );
 });
 
-test("skills/ contains exactly the 21 zh skill directories", () => {
+test(`skills/ contains exactly the ${expected.length} zh skill directories`, () => {
   const dirs = fs
     .readdirSync(skillsRoot, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
@@ -58,7 +83,7 @@ test("skills/ contains exactly the 21 zh skill directories", () => {
 });
 
 test("self-referential brand is replaced; upstream attribution kept", () => {
-  const read = (path) => fs.readFileSync(new URL(path, root), "utf8");
+  const read = (path) => readText(new URL(path, root));
 
   // FORK_MARK spots that actually exist upstream (3 files carry the mark).
   for (const path of [
@@ -108,14 +133,27 @@ test("no forbidden jev vocabulary anywhere in the zh skill tree", () => {
       if (entry.isDirectory()) {
         walk(path);
       } else {
-        const text = fs.readFileSync(path, "utf8");
+        const text = readText(path);
         assert.doesNotMatch(
           text,
           /jev-axi|jev-scout|jev-guard|git jev check|TYPESAFE|limpet|supercov/,
-          `${path.pathname}: jev vocabulary forbidden in zh base`,
+          `${fileURLToPath(path)}: jev vocabulary forbidden in zh base`,
         );
       }
     }
   };
   walk(skillsRoot);
+});
+
+test("shell and entry scripts keep the git executable bit", () => {
+  for (const path of executableScripts) {
+    const line = execSync(`git ls-files -s -- ${path}`, {
+      encoding: "utf8",
+      cwd: repoRoot,
+    }).trim();
+    assert.ok(
+      line.startsWith("100755"),
+      `${path}: git index mode must be 100755, got "${line || "(untracked)"}"`,
+    );
+  }
 });
