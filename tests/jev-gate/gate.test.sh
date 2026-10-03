@@ -16,7 +16,35 @@ trap cleanup EXIT
 export HOME="$TMP/home"
 export TMPDIR="$STATE_DIR"
 SAVED_PATH="$PATH"
-export PATH="$BIN:$SAVED_PATH"
+
+# 从真实 PATH 中剔除任何「含 jev 门禁工具」的目录，构造 CLEAN_PATH：
+# 让「缺工具」用例在真实装了 jev-* 的机器上也确定。Git Bash 的 /usr/bin、
+# System32 等不含目标工具，原样保留；剔除以「目录含目标工具」为唯一条件。
+build_clean_path() {
+  local dir tool stage="" clean="" tainted
+  local IFS=':'
+  # 第一轮：剔除直接含目标可执行文件（git-jev 按 git 子命令载体文件名识别）的目录
+  for dir in $SAVED_PATH; do
+    [ -n "$dir" ] || continue
+    tainted=0
+    for tool in jev-axi jev-scout jev-guard supercov limpet git-jev; do
+      if [ -x "$dir/$tool" ] && [ ! -d "$dir/$tool" ]; then tainted=1; break; fi
+    done
+    [ "$tainted" = 0 ] && stage="${stage:+$stage:}$dir"
+  done
+  # 第二轮：目录内 git 若支持 `git jev` 子命令（与 jev-readiness 同口径探测），一并剔除；
+  # 以第一轮结果为 PATH 基底，保证 Git Bash 自身 git 能正常启动并给出“无此子命令”
+  for dir in $stage; do
+    if [ -x "$dir/git" ] && [ ! -d "$dir/git" ] \
+       && PATH="$dir:$stage" git jev --version >/dev/null 2>&1; then
+      continue
+    fi
+    clean="${clean:+$clean:}$dir"
+  done
+  printf '%s' "$clean"
+}
+CLEAN_PATH="$(build_clean_path)"
+export PATH="$BIN:$CLEAN_PATH"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -197,6 +225,22 @@ OUT="$(SCOUT_OUT='3 verified crates found
 cargo add serde' bash "$GATE" --project "$PA" scout 'need' 2>&1)"; RC=$?
 assert_eq "$RC" "0" "2.scout 有候选 → 0"
 
+# scout 数字前导边界：10/20/100 不得被子串误判为「0 verified crates」
+OUT="$(SCOUT_OUT='10 verified crates found' bash "$GATE" --project "$PA" scout 'need' 2>&1)"; RC=$?
+assert_eq "$RC" "0" "2.scout 10 verified crates → 0（数字边界）"
+OUT="$(SCOUT_OUT='20 verified crates found.' bash "$GATE" --project "$PA" scout 'need' 2>&1)"; RC=$?
+assert_eq "$RC" "0" "2.scout 20 verified crates. → 0（数字边界）"
+OUT="$(SCOUT_OUT='100 verified crates' bash "$GATE" --project "$PA" scout 'need' 2>&1)"; RC=$?
+assert_eq "$RC" "0" "2.scout 100 verified crates → 0（数字边界）"
+# 真零候选：前缀消息 + 跨行 GATE FAILED 仍硬失败
+OUT="$(SCOUT_OUT=$'[jev-scout] 0 verified crates found.\nGATE FAILED' bash "$GATE" --project "$PA" scout 'need' 2>&1)"; RC=$?
+assert_eq "$RC" "2" "2.scout 0 verified + GATE FAILED → 2"
+# 行尾无标点的 0 candidate（单复数各一）也必须命中（$ 边界）
+OUT="$(SCOUT_OUT='0 candidate' bash "$GATE" --project "$PA" scout 'need' 2>&1)"; RC=$?
+assert_eq "$RC" "2" "2.scout 行尾 0 candidate（单数）→ 2"
+OUT="$(SCOUT_OUT='search done: 0 candidates' bash "$GATE" --project "$PA" scout 'need' 2>&1)"; RC=$?
+assert_eq "$RC" "2" "2.scout 行尾 0 candidates（复数）→ 2"
+
 # quality
 OUT="$(SUPERCOV_OUT='quality ok, 0 weak files' bash "$GATE" --project "$PA" quality src 2>&1)"; RC=$?
 assert_eq "$RC" "0" "2.quality 干净 → 0"
@@ -209,6 +253,31 @@ assert_contains "$OUT" "判定否决" "2.quality 否决文案"
 OUT="$(SUPERCOV_OUT=$'supercov quality\n0 weak files, 0 critical' SUPERCOV_RC=0 \
   bash "$GATE" --project "$PA" quality src 2>&1)"; RC=$?
 assert_eq "$RC" "0" "2.quality 零计数不算否决"
+
+# quality 字段名锚定：字段名之前的数字（Scanned 50）不得被吃进窗口
+OUT="$(SUPERCOV_OUT='Scanned 50 files; weak files: 0' bash "$GATE" --project "$PA" quality src 2>&1)"; RC=$?
+assert_eq "$RC" "0" "2.quality Scanned 50 不污染 weak files: 0 → 0"
+OUT="$(SUPERCOV_OUT='weak files: 3' bash "$GATE" --project "$PA" quality src 2>&1)"; RC=$?
+assert_eq "$RC" "2" "2.quality weak files: 3 → 2"
+# deep_nesting 浮点阈值严格 >0.90（0.90 本身通过；整数 1 否决）
+OUT="$(SUPERCOV_OUT='deep_nesting: 0.5' bash "$GATE" --project "$PA" quality src 2>&1)"; RC=$?
+assert_eq "$RC" "0" "2.quality deep_nesting 0.5 → 0"
+OUT="$(SUPERCOV_OUT='deep_nesting: 0.90' bash "$GATE" --project "$PA" quality src 2>&1)"; RC=$?
+assert_eq "$RC" "0" "2.quality deep_nesting 0.90（边界相等）→ 0"
+OUT="$(SUPERCOV_OUT='deep_nesting: 0.95' bash "$GATE" --project "$PA" quality src 2>&1)"; RC=$?
+assert_eq "$RC" "2" "2.quality deep_nesting 0.95 → 2"
+OUT="$(SUPERCOV_OUT='deep_nesting 1' bash "$GATE" --project "$PA" quality src 2>&1)"; RC=$?
+assert_eq "$RC" "2" "2.quality deep_nesting 1（空白分隔）→ 2"
+# unhandled_errors / duplicated_logic 属 0 容忍类：任何 >0（含小数）即否决
+OUT="$(SUPERCOV_OUT='unhandled_errors: 0' bash "$GATE" --project "$PA" quality src 2>&1)"; RC=$?
+assert_eq "$RC" "0" "2.quality unhandled_errors 0 → 0"
+OUT="$(SUPERCOV_OUT='unhandled_errors: 0.05' bash "$GATE" --project "$PA" quality src 2>&1)"; RC=$?
+assert_eq "$RC" "2" "2.quality unhandled_errors 0.05 → 2"
+OUT="$(SUPERCOV_OUT='duplicated_logic: 2' bash "$GATE" --project "$PA" quality src 2>&1)"; RC=$?
+assert_eq "$RC" "2" "2.quality duplicated_logic 2 → 2"
+# 无数字的总结性 critical 标记：同行含 critical 与反模式名 → 否决
+OUT="$(SUPERCOV_OUT='unhandled_errors (critical)' bash "$GATE" --project "$PA" quality src 2>&1)"; RC=$?
+assert_eq "$RC" "2" "2.quality unhandled_errors 同行 critical → 2"
 
 # limpet（laya 桥可用，但 limpet 门不依赖后端）
 OUT="$(LIMPET_RC=0 bash "$GATE" --project "$PA" limpet check 2>&1)"; RC=$?

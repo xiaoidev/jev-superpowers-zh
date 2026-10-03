@@ -18,7 +18,35 @@ trap cleanup EXIT
 export HOME="$TMP/home"
 export TMPDIR="$STATE_DIR"
 SAVED_PATH="$PATH"
-export PATH="$BIN:$SAVED_PATH"
+
+# 从真实 PATH 中剔除任何「含 jev 门禁工具」的目录，构造 CLEAN_PATH：
+# 让「无工具/部分工具」用例在真实装了 jev-* 的机器上也确定。Git Bash 的
+# /usr/bin、System32 等不含目标工具，原样保留；剔除以「目录含目标工具」为唯一条件。
+build_clean_path() {
+  local dir tool stage="" clean="" tainted
+  local IFS=':'
+  # 第一轮：剔除直接含目标可执行文件（git-jev 按 git 子命令载体文件名识别）的目录
+  for dir in $SAVED_PATH; do
+    [ -n "$dir" ] || continue
+    tainted=0
+    for tool in jev-axi jev-scout jev-guard supercov limpet git-jev; do
+      if [ -x "$dir/$tool" ] && [ ! -d "$dir/$tool" ]; then tainted=1; break; fi
+    done
+    [ "$tainted" = 0 ] && stage="${stage:+$stage:}$dir"
+  done
+  # 第二轮：目录内 git 若支持 `git jev` 子命令（与本脚本就绪探测同口径），一并剔除；
+  # 以第一轮结果为 PATH 基底，保证 Git Bash 自身 git 能正常启动并给出“无此子命令”
+  for dir in $stage; do
+    if [ -x "$dir/git" ] && [ ! -d "$dir/git" ] \
+       && PATH="$dir:$stage" git jev --version >/dev/null 2>&1; then
+      continue
+    fi
+    clean="${clean:+$clean:}$dir"
+  done
+  printf '%s' "$clean"
+}
+CLEAN_PATH="$(build_clean_path)"
+export PATH="$BIN:$CLEAN_PATH"
 
 PASS_COUNT=0
 FAIL_COUNT=0
@@ -265,7 +293,13 @@ assert_eq "$(jget notified <<<"$OUT")" "true" "6.10 --cached 读到 notified=tru
 clear_state
 rd_run "$P6" --cached
 assert_eq "$(jget state <<<"$OUT")" "DEGRADED" "6.11 --cached 缓存缺失时回退正常探测"
-assert_eq "$(state_file)" "$(state_file)" "6.12 回退探测后已写缓存"
+SF612="$(state_file)"
+if [ -n "$SF612" ] && [ -f "$SF612" ] \
+   && printf '%s' "$SF612" | grep -Eq 'jevzh-.+\.state$'; then
+  ok "6.12 回退探测后已写缓存（路径非空、文件存在、命名 jevzh-*.state）"
+else
+  no "6.12 缓存断言失败（state_file=[$SF612]）"
+fi
 
 # --cached 命中时 --mark-notified 也应更新缓存
 rd_run "$P6" --mark-notified
@@ -273,14 +307,15 @@ assert_eq "$(jget notified <"$SF")" "true" "6.13 缓存内 notified 保持 true"
 
 # ---------------------------------------------------------------------------
 # 组 7：--json 可解析 + 人类报告含安装命令
-# 注意：此时 BIN 已装 6 stub，组 7 需要“无工具”环境，用 PATH 去掉 BIN 模拟
+# 注意：此时 BIN 已装 6 stub，组 7 需要“无工具”环境：PATH 去掉 BIN 并用
+# CLEAN_PATH（已剔除真实系统中可能安装的 jev-* 工具目录）模拟
 # ---------------------------------------------------------------------------
 clear_state
-OUT="$(PATH="$SAVED_PATH" bash "$RD" --project "$P1" --json 2>"$TMP/rd.err")"
+OUT="$(PATH="$CLEAN_PATH" bash "$RD" --project "$P1" --json 2>"$TMP/rd.err")"
 node -e 'JSON.parse(require("fs").readFileSync(0,"utf8"));process.stdout.write("ok")' <<<"$OUT" > "$TMP/71"
 assert_eq "$(cat "$TMP/71")" "ok" "7.1 --json 输出可被 JSON.parse"
 
-OUT="$(PATH="$SAVED_PATH" bash "$RD" --project "$P1" 2>"$TMP/rd.err")"
+OUT="$(PATH="$CLEAN_PATH" bash "$RD" --project "$P1" 2>"$TMP/rd.err")"
 RC=$?
 assert_eq "$RC" "0" "7.2 人类报告退出码 0"
 assert_contains "$OUT" "DEGRADED" "7.3 报告含四态"

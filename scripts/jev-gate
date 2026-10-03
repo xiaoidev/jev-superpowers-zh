@@ -234,8 +234,14 @@ case "$SUB" in
 
   scout)
     if [ "$NRC" -ne 0 ]; then reject "jev-scout 以退出码 $NRC 失败。"; fi
-    # 只自动拦截“0 候选/门失败”这类确定硬失败；Fit/Noul 阈值由计划阶段的 agent 按技能约束执行
-    if printf '%s' "$CAPTURED" | grep -Eiq '0 verified crates|0 verified|gate failed|0 matching candidates|0 candidates?[^0-9]'; then
+    # 只自动拦截“0 候选/门失败”这类确定硬失败；Fit/Noul 阈值由计划阶段的 agent 按技能约束执行。
+    # 数字 0 必须带前导边界（行首或非数字/非小数点字符），避免 10/20/100 verified crates
+    # 被子串误命中；grep 天然逐行匹配，模式不会跨行。
+    if printf '%s\n' "$CAPTURED" | grep -Eiq \
+      -e '(^|[^0-9.])0[[:space:]]+verified[[:space:]]+crates?' \
+      -e '(^|[^0-9.])0[[:space:]]+matching[[:space:]]+candidates?' \
+      -e '(^|[^0-9.])0[[:space:]]+candidates?([^0-9]|$)' \
+      -e 'GATE[[:space:]]*FAILED'; then
       reject "jev-scout 报告 0 个经核实候选（门失败），禁止凭想象选依赖；请调整需求描述或扩大生态范围后重试。"
     fi
     exit 0
@@ -243,22 +249,49 @@ case "$SUB" in
 
   quality)
     if [ "$NRC" -ne 0 ]; then reject "supercov quality 以退出码 $NRC 失败。"; fi
-    # 保守判定：反模式关键词必须伴随正计数才算命中（“0 weak files”不算）
-    QUALITY_BAD="$(printf '%s' "$CAPTURED" | node -e '
-      let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
-        const kws=["weak files","critical","unhandled_errors","duplicated_logic","deep_nesting"];
-        for(const line of s.split(/\r?\n/)){
-          const low=line.toLowerCase();
-          for(const k of kws){
-            const i=low.indexOf(k);
-            if(i<0) continue;
-            const win=low.slice(Math.max(0,i-20), i+k.length+24);
-            const nums=[...win.matchAll(/[0-9]+/g)].map(m=>Number(m[0]));
-            if(nums.some(n=>n>0)){ process.stdout.write("1"); return; }
-          }
-        }
-      });')"
-    [ "$QUALITY_BAD" = 1 ] && reject "supercov 报告含非零反模式计数（weak files / critical / unhandled_errors / duplicated_logic 等），先消除根因再谈完成。"
+    # 按字段名锚定、逐行解析（spec §4.1：0 个 weak files；unhandled_errors /
+    # duplicated_logic 计数 >0 即否决；deep_nesting 数值严格 >0.90 才否决）。
+    # 只取字段名之后紧邻的第一个数字（冒号/等号/空白分隔，40 字符窗口内），
+    # 字段名之前的数字（如 “Scanned 50 files”）一律忽略；不做全局窗口扫描。
+    # q_field_num <行> <字段正则>：命中时输出字段名之后紧邻的数字，未命中返回 1
+    q_field_num() {
+      local qline="$1" qre="^(.*)$2" qtail
+      [[ "$qline" =~ $qre ]] || return 1
+      qtail="${qline:${#BASH_REMATCH[0]}:40}"
+      [[ "$qtail" =~ ^[[:space:]:=]*([0-9]+([.][0-9]+)?) ]] || return 1
+      printf '%s' "${BASH_REMATCH[1]}"
+    }
+    # 浮点比较：q_float_gt <x> <y> → x>y 时返回 0（禁止字符串比较）
+    q_float_gt() { node -e 'process.exit(Number(process.argv[1])>Number(process.argv[2])?0:1)' "$1" "$2" </dev/null; }
+
+    QLINE=""
+    QNUM=""
+    QBAD=0
+    shopt -s nocasematch
+    while IFS= read -r QLINE || [ -n "$QLINE" ]; do
+      # 总结性 critical 标记：同行同时出现 critical 与任一反模式名 → 否决
+      # （覆盖无数字的 “unhandled_errors (critical)” 类输出）
+      if [[ "$QLINE" == *critical* ]] && [[ "$QLINE" =~ unhandled_errors|deep_nesting|duplicated_logic ]]; then
+        QBAD=1; break
+      fi
+      # weak files / unhandled_errors / duplicated_logic：数字 >0 即否决（0 容忍类）。
+      # 四个字段各自独立锚定，避免同行多字段时短路或贪婪匹配漏掉靠前的正计数。
+      if QNUM="$(q_field_num "$QLINE" 'weak[[:space:]]+files?')"; then
+        q_float_gt "$QNUM" 0 && { QBAD=1; break; }
+      fi
+      if QNUM="$(q_field_num "$QLINE" 'unhandled_errors')"; then
+        q_float_gt "$QNUM" 0 && { QBAD=1; break; }
+      fi
+      if QNUM="$(q_field_num "$QLINE" 'duplicated_logic')"; then
+        q_float_gt "$QNUM" 0 && { QBAD=1; break; }
+      fi
+      # deep_nesting：阈值严格 >0.90（0.90 本身通过，0.5/0.05 等小数值不否决）
+      if QNUM="$(q_field_num "$QLINE" 'deep_nesting')"; then
+        q_float_gt "$QNUM" 0.90 && { QBAD=1; break; }
+      fi
+    done <<< "$CAPTURED"
+    shopt -u nocasematch
+    [ "$QBAD" = 1 ] && reject "supercov 报告含非零反模式计数（weak files / critical / unhandled_errors / duplicated_logic 等），先消除根因再谈完成。"
     exit 0
     ;;
 
