@@ -2,7 +2,9 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import test from "node:test";
 
-const pkg = JSON.parse(fs.readFileSync("package.json", "utf8"));
+const root = new URL("../../", import.meta.url);
+
+const pkg = JSON.parse(fs.readFileSync(new URL("package.json", root), "utf8"));
 
 test("package exposes jevzh", () => {
   assert.equal(pkg.name, "jev-superpowers-zh");
@@ -11,7 +13,9 @@ test("package exposes jevzh", () => {
 });
 
 test("config template uses local-first defaults", () => {
-  const config = JSON.parse(fs.readFileSync(".jevzh.json.example", "utf8"));
+  const config = JSON.parse(
+    fs.readFileSync(new URL(".jevzh.json.example", root), "utf8"),
+  );
   assert.deepEqual(config, {
     backend: "auto",
     strict: false,
