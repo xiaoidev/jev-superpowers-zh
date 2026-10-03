@@ -11,7 +11,7 @@
     "jevzh": "bin/jevzh.js"
   },
   "scripts": {
-    "test": "node --test tests/**/*.test.{js,mjs,cjs}",
+    "test": "node --test",
     "version": "node scripts/sync-plugin-version.js && git add .claude-plugin/plugin.json .claude-plugin/marketplace.json .cursor-plugin/plugin.json .codex-plugin/plugin.json gemini-extension.json"
   },
   "files": [
