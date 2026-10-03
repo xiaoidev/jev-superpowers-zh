@@ -1,6 +1,6 @@
 ---
 name: jev-writing-plans
-description: 当你已有多步骤任务的规格或需求、即将动手写代码之前使用——编写小步 TDD 计划，并用 jev-scout 核验真实 crate 与库，杜绝幻觉包；工具或后端缺失时软降级回标准 writing-plans
+description: 当你已有多步骤任务的规格或需求、即将动手写代码之前使用——编写小步 TDD 计划，并用 jev-scout 核验真实 crate 与库，杜绝幻觉包；工具或后端缺失时软降级回标准中文技能 writing-plans
 ---
 
 派生自 jev-superpowers，汉化 + 软降级改造。
@@ -38,7 +38,7 @@ jev-scout "fast memory mapped ring buffer in rust" --ecosystem crates --json
 
 此时必须改用已核验的替代方案（如真实存在的 crate 或标准库原语），不得把未核验依赖写进计划。
 
-**就绪检查**：若本会话状态为 DEGRADED，或 `jev-scout` 不在就绪清单中 → 不要执行该命令，向用户说明缺失项及安装方式（`cargo install jev-scout`；云端需设置有效的 `TYPESAFE_API_KEY`，本地桥需 `TYPESAFE_BASE_URL` 可达），转标准技能「`writing-plans`」继续；若命令已执行但结论为否决（0 候选、Fit < 2.0、Noul ≤ 0.50，或拿不到可粘贴的真实安装命令）→ 无论是否严格模式都停止，按阈值表处理，不得假装通过。
+**就绪检查**：若本会话状态为 DEGRADED，或 `jev-scout` 不在就绪清单中 → 不要执行该命令，向用户说明缺失项及安装方式（`cargo install jev-scout`；云端需设置有效的 `TYPESAFE_API_KEY`，本地桥需 `TYPESAFE_BASE_URL` 可达），转标准中文技能「`writing-plans`」继续；若命令已执行但结论为否决（0 候选、Fit < 2.0、Noul ≤ 0.50，或拿不到可粘贴的真实安装命令）→ 无论是否严格模式（strict）都停止，按阈值表处理，不得假装通过。
 
 ## 任务结构与小步拆分
 
@@ -61,7 +61,7 @@ jev-scout "fast memory mapped ring buffer in rust" --ecosystem crates --json
 
 阈值表见 docs/CONFIDENCE.zh.md，两类失败严格区分：
 
-- **环境型失败**（`jev-scout` 不在 PATH / key 缺失 / registry 或后端不可达）：soft 模式显著告知 + 跳过该门 + 转标准技能「`writing-plans`」；strict 模式按上游硬 STOP（exit 2 / 打印安装指引）。
+- **环境型失败**（`jev-scout` 不在 PATH / key 缺失 / registry 或后端不可达）：软降级模式（soft）显著告知 + 跳过该门 + 转标准中文技能「`writing-plans`」；严格模式按上游硬 STOP（exit 2 / 打印安装指引）。
 - **判定型失败**（门跑了但否决：0 候选、Fit < 2.0、Noul 维护概率 ≤ 0.50、无真实安装命令）：任何模式都阻断或转人工，软降级绝不放行。
 
 降级提示每会话醒目告知一次，绝不静默降级。

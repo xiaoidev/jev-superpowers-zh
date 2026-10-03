@@ -26,12 +26,12 @@ Skills 位于 `.gemini/skills/` 目录，每个 skill 有独立的 `SKILL.md` �
 - **dispatching-parallel-agents**: 当面对 2 个以上可以独立进行、无共享状态或顺序依赖的任务时使用
 - **executing-plans**: 当你要在当前会话里亲自担任实现者执行一份实现计划时使用——你的人类伙伴选择了内联执行，或者没有可用的子智能体工具
 - **finishing-a-development-branch**: 当实现完成、所有测试通过、需要决定如何集成工作时使用——通过提供合并、PR 或清理等结构化选项来引导开发工作的收尾
-- **jev-brainstorming**: 架构与技术选型的 jev 门禁版头脑风暴——继承 brainstorming，用 `jev-axi pick` 做权衡收敛，置信度 ≥0.80 才直接建议、0.50–0.80 由人工破平；工具或后端缺失时软降级回标准 brainstorming
-- **jev-executing-plans**: 执行书面实现计划时使用——继承 executing-plans，危险命令先过 `jev-guard`，提交前 `git jev check`（secrets/payload p<0.10 且须有 [PASS]）；缺失时软降级回标准 executing-plans
-- **jev-systematic-debugging**: 遇到 bug、测试或构建失败时使用——继承 systematic-debugging，坚持无根因不修复，用 `jev-axi triage` 分诊、`jev-axi check` 对假设排序（取 p>0.70）；缺失时软降级回标准 systematic-debugging
+- **jev-brainstorming**: 架构与技术选型的 jev 门禁版头脑风暴——继承 brainstorming，用 `jev-axi pick` 做权衡收敛，置信度 ≥ 0.80 才直接建议、0.50–0.80 由人工破平；工具或后端缺失时软降级回标准 brainstorming
+- **jev-executing-plans**: 执行书面实现计划时使用——继承 executing-plans，危险命令先过 `jev-guard`，提交前 `git jev check`（secrets/payload p < 0.10 且须有 [PASS]）；缺失时软降级回标准 executing-plans
+- **jev-systematic-debugging**: 遇到 bug、测试或构建失败时使用——继承 systematic-debugging，坚持无根因不修复，用 `jev-axi triage` 分诊、`jev-axi check` 对假设排序（取 p > 0.70）；缺失时软降级回标准 systematic-debugging
 - **jev-using-superpowers**: jev 门禁总路由——五阶段路由矩阵与全量 27 技能清单，说明前置工具、FULL/LOCAL/PARTIAL/DEGRADED 四态、软降级/严格模式与 `scripts/jev-gate` 统一入口
 - **jev-verification**: 宣称完成前使用——继承 verification-before-completion，要求新鲜测试证据、`supercov quality` 0 个 weak files（deep_nesting > 0.90 等）与 limpet 停止策略核验；缺失时软降级回标准 verification-before-completion
-- **jev-writing-plans**: 动手写代码前使用——继承 writing-plans，编写小步 TDD 计划并用 `jev-scout --ecosystem`（支持 `--json`）核验真实依赖，Fit ≥2.0、Noul >0.50，0 候选即门失败；缺失时软降级回标准 writing-plans
+- **jev-writing-plans**: 动手写代码前使用——继承 writing-plans，编写小步 TDD 计划并用 `jev-scout --ecosystem`（支持 `--json`）核验真实依赖，Fit ≥ 2.0、Noul > 0.50，0 候选即门失败；缺失时软降级回标准 writing-plans
 - **mcp-builder**: MCP 服务器构建方法论 — 系统化构建生产级 MCP 工具，让 AI 助手连接外部能力
 - **receiving-code-review**: 收到代码审查反馈后、实施建议之前使用，尤其当反馈不明确或技术上有疑问时——需要技术严谨性和验证，而非敷衍附和或盲目执行
 - **requesting-code-review**: 完成任务、实现重要功能或合并前使用，用于验证工作成果是否符合要求

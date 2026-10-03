@@ -1,6 +1,6 @@
 ---
 name: jev-executing-plans
-description: 执行书面实现计划时使用——指导逐步骤 TDD 执行，并以 jev-guard 强制命令安全、以 git-jev 在提交前筛查 diff；工具或后端缺失时软降级回标准 executing-plans
+description: 执行书面实现计划时使用——指导逐步骤 TDD 执行，并以 jev-guard 强制命令安全、以 git-jev 在提交前筛查 diff；工具或后端缺失时软降级回标准中文技能 executing-plans
 ---
 
 派生自 jev-superpowers，汉化 + 软降级改造。
@@ -25,7 +25,7 @@ description: 执行书面实现计划时使用——指导逐步骤 TDD 执行�
 jev-guard "<待执行命令>"
 ```
 
-真实输出示例（以下为英文原样输出，逐字保留）：
+真实输出示例（输出主体为英文原样、逐字保留；`#` 开头行为中文说明）：
 
 ```text
 # 安全命令：即时放行（<80ms）
@@ -39,7 +39,7 @@ top_hazard: destructive (0.96)
 
 只要输出出现 `verdict: block` 或命令被标记为破坏性 / 不安全：停止并请求用户明确人工确认，任何模式都不得自动执行。
 
-**就绪检查**：若本会话状态为 DEGRADED，或 `jev-guard` 不在就绪清单中 → 不要执行该命令，向用户说明缺失项及安装方式（随 `npm install -g jev-axi` 一并安装，亦可独立安装；后端需有效的 `TYPESAFE_API_KEY` 或可达的 `TYPESAFE_BASE_URL`），转标准技能「`executing-plans`」继续；若命令已执行但结论为否决（`verdict: block`）→ 无论是否严格模式都停止并请求人工确认，按阈值表处理，不得假装通过。
+**就绪检查**：若本会话状态为 DEGRADED，或 `jev-guard` 不在就绪清单中 → 不要执行该命令，向用户说明缺失项及安装方式（随 `npm install -g jev-axi` 一并安装，亦可独立安装；后端需有效的 `TYPESAFE_API_KEY` 或可达的 `TYPESAFE_BASE_URL`），转标准中文技能「`executing-plans`」继续；若命令已执行但结论为否决（`verdict: block`）→ 无论是否严格模式（strict）都停止并请求人工确认，按阈值表处理，不得假装通过。
 
 ### 3. 提交前反射门（git-jev）
 
@@ -57,7 +57,7 @@ top_hazard: destructive (0.96)
    - 无破坏性 payload 或后门模式（p < 0.10）。
 4. 仅在输出含 `[PASS]` 后才可提交；FAIL 永不提交。
 
-真实输出示例：
+真实输出示例（以下为英文原样输出，逐字保留）：
 
 ```text
 ✔ No secrets detected (p=0.02)
@@ -65,7 +65,7 @@ top_hazard: destructive (0.96)
 [PASS] Commit diff verified by git-jev.
 ```
 
-**就绪检查**：若本会话状态为 DEGRADED，或 git-jev 不在就绪清单中（`git jev --version` 探测失败）→ 不要执行 `git jev check`，向用户说明缺失项及安装方式（`git jev install`），转标准技能「`executing-plans`」的流程继续；若命令已执行但结论为否决（输出无 `[PASS]`、secrets 概率 p ≥ 0.10、或 payload 概率 p ≥ 0.10）→ 无论是否严格模式都阻断，先修复再提交，不得假装通过。
+**就绪检查**：若本会话状态为 DEGRADED，或 git-jev 不在就绪清单中（`git jev --version` 探测失败）→ 不要执行 `git jev check`，向用户说明缺失项及安装方式（`git jev install`），转标准中文技能「`executing-plans`」的流程继续；若命令已执行但结论为否决（输出无 `[PASS]`、secrets 概率 p ≥ 0.10、或 payload 概率 p ≥ 0.10）→ 无论是否严格模式都阻断，先修复再提交，不得假装通过。
 
 ### 4. 遇阻即停
 
@@ -73,7 +73,7 @@ top_hazard: destructive (0.96)
 
 - 立即停止。
 - 不要强行改动，不要盲目对症修补。
-- 转 `jev-systematic-debugging`（其标准底座为 `systematic-debugging`）。
+- 转 `jev-systematic-debugging`（其标准中文技能为 `systematic-debugging`）。
 
 ## 经统一入口调用
 
@@ -83,7 +83,7 @@ top_hazard: destructive (0.96)
 
 阈值表见 docs/CONFIDENCE.zh.md，两类失败严格区分：
 
-- **环境型失败**（`jev-guard` / git-jev 不在 PATH、key 缺失、后端不可达）：soft 模式显著告知 + 跳过该门 + 转标准技能「`executing-plans`」；strict 模式按上游硬 STOP（exit 2 / 打印安装指引）。
+- **环境型失败**（`jev-guard` / git-jev 不在 PATH、key 缺失、后端不可达）：软降级模式（soft）显著告知 + 跳过该门 + 转标准中文技能「`executing-plans`」；严格模式按上游硬 STOP（exit 2 / 打印安装指引）。
 - **判定型失败**（门跑了但否决：`verdict: block`、`git jev check` 无 `[PASS]`、secrets 或 payload 概率 p ≥ 0.10）：任何模式都阻断或转人工，软降级绝不放行。
 
 降级提示每会话醒目告知一次，绝不静默降级。

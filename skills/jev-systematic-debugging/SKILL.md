@@ -1,6 +1,6 @@
 ---
 name: jev-systematic-debugging
-description: 遇到任何 bug、测试失败或构建错误时使用——强制先做根因调查，以 jev-axi triage 经 stdin 管道分诊构建错误、以 jev-axi check 对假设排序；工具或后端缺失时软降级回标准 systematic-debugging
+description: 遇到任何 bug、测试失败或构建错误时使用——强制先做根因调查，以 jev-axi triage 经 stdin 管道分诊构建错误、以 jev-axi check 对假设排序；工具或后端缺失时软降级回标准中文技能 systematic-debugging
 ---
 
 派生自 jev-superpowers，汉化 + 软降级改造。
@@ -36,7 +36,7 @@ root_cause: Expected `u64` but found `usize` in buffer offset calculation at src
 fix_direction: Cast index using `as u64` or modify struct field to `usize`.
 ```
 
-**就绪检查**：若本会话状态为 DEGRADED，或 `jev-axi` 不在就绪清单中 → 不要执行该命令，向用户说明缺失项及安装方式（`npm install -g jev-axi`；云端需设置有效的 `TYPESAFE_API_KEY`，本地桥需 `TYPESAFE_BASE_URL` 可达），转标准技能「`systematic-debugging`」继续；若命令已执行但拿不到 domain / root_cause / fix_direction 结论 → 无论是否严格模式都停止，继续手工取证，按阈值表处理，不得假装通过。
+**就绪检查**：若本会话状态为 DEGRADED，或 `jev-axi` 不在就绪清单中 → 不要执行该命令，向用户说明缺失项及安装方式（`npm install -g jev-axi`；云端需设置有效的 `TYPESAFE_API_KEY`，本地桥需 `TYPESAFE_BASE_URL` 可达），转标准中文技能「`systematic-debugging`」继续；若命令已执行但拿不到 domain / root_cause / fix_direction 结论 → 无论是否严格模式（strict）都停止，继续手工取证，按阈值表处理，不得假装通过。
 
 ### 阶段 2：假设生成与 Jev 评分
 
@@ -48,7 +48,7 @@ jev-axi check "Does this stack trace support the hypothesis: <假设>?" --state 
 
 选取经验证概率最高的假设（p > 0.70）作为修复方向。若全部假设均 p < 0.70，继续收集证据，禁止盲修。
 
-**就绪检查**：若本会话状态为 DEGRADED，或 `jev-axi` 不在就绪清单中 → 不要执行该命令，向用户说明缺失项及安装方式，转标准技能「`systematic-debugging`」继续；若命令已执行但所有假设均低于 0.70 → 无论是否严格模式都回到取证循环，不得选取低置信假设硬修，不得假装通过。
+**就绪检查**：若本会话状态为 DEGRADED，或 `jev-axi` 不在就绪清单中 → 不要执行该命令，向用户说明缺失项及安装方式（`npm install -g jev-axi`；云端需设置有效的 `TYPESAFE_API_KEY`，本地桥需 `TYPESAFE_BASE_URL` 可达），转标准中文技能「`systematic-debugging`」继续；若命令已执行但所有假设均低于 0.70 → 无论是否严格模式都回到取证循环，不得选取低置信假设硬修，不得假装通过。
 
 ### 阶段 3：最小复现测试用例
 
@@ -66,7 +66,7 @@ jev-axi check "Does this stack trace support the hypothesis: <假设>?" --state 
 
 阈值表见 docs/CONFIDENCE.zh.md，两类失败严格区分：
 
-- **环境型失败**（`jev-axi` 不在 PATH / key 缺失 / 后端不可达）：soft 模式显著告知 + 跳过该门 + 转标准技能「`systematic-debugging`」；strict 模式按上游硬 STOP（exit 2 / 打印安装指引）。
+- **环境型失败**（`jev-axi` 不在 PATH / key 缺失 / 后端不可达）：软降级模式（soft）显著告知 + 跳过该门 + 转标准中文技能「`systematic-debugging`」；严格模式按上游硬 STOP（exit 2 / 打印安装指引）。
 - **判定型失败**（门跑了但否决：全部假设 p < 0.70，或 triage 无法定位 root_cause）：任何模式都阻断或转人工，继续取证，软降级绝不放行。
 
 降级提示每会话醒目告知一次，绝不静默降级。
