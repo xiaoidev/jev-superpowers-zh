@@ -1,0 +1,88 @@
+{
+  "name": "jev-superpowers-zh",
+  "version": "0.1.0",
+  "engines": {
+    "node": ">=20.0.0"
+  },
+  "description": "以 superpowers-zh 中文方法论为底座、叠加 6 个汉化 jev 门禁技能的整合版，门禁默认软降级，支持 Claude Code / Cursor 等 26 款 AI 编程工具",
+  "type": "module",
+  "main": ".opencode/plugins/superpowers.js",
+  "bin": {
+    "jevzh": "bin/jevzh.js"
+  },
+  "scripts": {
+    "version": "node scripts/sync-plugin-version.js && git add .claude-plugin/plugin.json .claude-plugin/marketplace.json .cursor-plugin/plugin.json .codex-plugin/plugin.json gemini-extension.json"
+  },
+  "files": [
+    "bin/",
+    "skills/",
+    "hooks/",
+    "scripts/",
+    "assets/",
+    ".claude-plugin/",
+    ".cursor-plugin/",
+    ".codex-plugin/",
+    ".codex/INSTALL.md",
+    ".opencode/",
+    ".pi/extensions/",
+    "CLAUDE.md",
+    "AGENTS.md",
+    "GEMINI.md",
+    "RELEASE-NOTES.zh.md",
+    "gemini-extension.json",
+    "docs/",
+    "index.js",
+    "README.md",
+    "LICENSE"
+  ],
+  "keywords": [
+    "superpowers",
+    "jev",
+    "jevzh",
+    "jev-superpowers",
+    "claude-code",
+    "cursor",
+    "codex",
+    "gemini",
+    "kiro",
+    "deerflow",
+    "trae",
+    "antigravity",
+    "openclaw",
+    "windsurf",
+    "aider",
+    "opencode",
+    "qwen",
+    "vscode",
+    "copilot",
+    "hermes",
+    "hermes-agent",
+    "claw-code",
+    "qoder",
+    "codebuddy",
+    "codearts",
+    "ai-coding",
+    "skills",
+    "chinese",
+    "中文",
+    "tdd",
+    "debugging",
+    "code-review",
+    "pi-package"
+  ],
+  "pi": {
+    "skills": [
+      "./skills"
+    ],
+    "extensions": [
+      "./.pi/extensions/superpowers.ts"
+    ]
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/xiaoidev/jev-superpowers-zh.git"
+  },
+  "homepage": "https://github.com/xiaoidev/jev-superpowers-zh",
+  "author": "jev-superpowers-zh contributors",
+  "license": "MIT"
+}

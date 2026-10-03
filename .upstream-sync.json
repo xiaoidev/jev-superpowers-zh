@@ -1,0 +1,34 @@
+{
+  "sources": [
+    {
+      "name": "zh",
+      "repo": "https://github.com/jnMetaCode/superpowers-zh",
+      "commit": "c6eccb1d0588c69d94146733c5bf20f6311406be",
+      "version": "v1.7.14",
+      "date": "2026-10-03",
+      "trackedPaths": [
+        "skills 下 21 个 zh 技能目录",
+        "tests",
+        "docs/README.*.md"
+      ]
+    },
+    {
+      "name": "jev",
+      "repo": "https://github.com/AkashPriyadarshii/jev-superpowers",
+      "commit": "4e5f569653a4fdb321afe1ef7f4a3c23ef7130a9",
+      "version": "master",
+      "date": "2026-10-03",
+      "trackedPaths": [
+        "skills/jev-*",
+        "scripts/serve-laya.py",
+        "docs/CONFIDENCE.md"
+      ]
+    }
+  ],
+  "declaredDivergences": [
+    "hooks/hooks.json 与 hooks/hooks-cursor.json 为 jevzh 合并衍件（zh 仅 SessionStart，jev 三道），不属任一源的镜像",
+    "hooks/session-start 以 zh 版为基座，有意改注入 jev-using-superpowers + 就绪段",
+    "hooks/pre-commit、hooks/stop 迁自 jev，有意加软降级分支",
+    "bin/jevzh.js fork 自 zh bin/superpowers-zh.js，有意改品牌/参数/钩子安装"
+  ]
+}
