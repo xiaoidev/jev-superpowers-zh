@@ -73,13 +73,33 @@ test("all zh skills have frontmatter and no jev calls", () => {
   );
 });
 
+const jevSkills = [
+  "jev-using-superpowers",
+  "jev-brainstorming",
+  "jev-writing-plans",
+  "jev-executing-plans",
+  "jev-systematic-debugging",
+  "jev-verification",
+];
+
 test(`skills/ contains exactly the ${expected.length} zh skill directories`, () => {
+  const dirs = fs
+    .readdirSync(skillsRoot, { withFileTypes: true })
+    .filter((entry) => entry.isDirectory())
+    .map((entry) => entry.name);
+  // 21 个 zh 底座集合仍精确存在：除 jev-* 外不得有任何多余目录。
+  const zhDirs = dirs.filter((name) => !name.startsWith("jev-")).sort();
+  assert.deepEqual(zhDirs, [...expected].sort());
+});
+
+test("skills/ contains 27 directories in total (21 zh + 6 jev)", () => {
   const dirs = fs
     .readdirSync(skillsRoot, { withFileTypes: true })
     .filter((entry) => entry.isDirectory())
     .map((entry) => entry.name)
     .sort();
-  assert.deepEqual(dirs, [...expected].sort());
+  assert.deepEqual(dirs, [...expected, ...jevSkills].sort());
+  assert.equal(dirs.length, 27);
 });
 
 test("self-referential brand is replaced; upstream attribution kept", () => {
@@ -142,7 +162,11 @@ test("no forbidden jev vocabulary anywhere in the zh skill tree", () => {
       }
     }
   };
-  walk(skillsRoot);
+  // jev 词汇检查只针对 21 个 zh 底座技能；6 个 jev-* 技能由
+  // jev-contract.test.mjs 另行约束。
+  for (const name of expected) {
+    walk(new URL(`skills/${name}/`, root));
+  }
 });
 
 test("shell and entry scripts keep the git executable bit", () => {
