@@ -1,0 +1,355 @@
+#!/usr/bin/env bash
+# scripts/jev-readiness — jev-superpowers-zh 门禁就绪检测
+#
+# 依据：docs/superpowers/specs/2026-10-03-jev-superpowers-zh-integration-design.md
+#       §4.2 后端协议、§5.1 配置优先级、§5.2 就绪探测
+#
+# 用法：jev-readiness [--project <dir>] [--json] [--cached] [--mark-notified]
+# 退出码：就绪检测本身恒为 0（参数错误为 64）。
+set -u
+
+# ---------------------------------------------------------------------------
+# 参数解析
+# ---------------------------------------------------------------------------
+PROJECT_ARG=""
+AS_JSON=0
+USE_CACHED=0
+MARK_NOTIFIED=0
+
+usage() {
+  cat >&2 <<'EOF'
+用法：jev-readiness [--project <dir>] [--json] [--cached] [--mark-notified]
+  --project <dir>   指定项目目录（默认 $JEVZH_PROJECT → git 顶层 → 当前目录）
+  --json            只打印 state JSON
+  --cached          缓存命中则直接使用，不重新探测
+  --mark-notified   将缓存中的 notified 置为 true
+EOF
+}
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project)
+      [ $# -ge 2 ] || { usage; exit 64; }
+      PROJECT_ARG="$2"; shift 2 ;;
+    --project=*) PROJECT_ARG="${1#*=}"; shift ;;
+    --json) AS_JSON=1; shift ;;
+    --cached) USE_CACHED=1; shift ;;
+    --mark-notified) MARK_NOTIFIED=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage; exit 64 ;;
+  esac
+done
+
+# ---------------------------------------------------------------------------
+# 项目目录与缓存路径
+# ---------------------------------------------------------------------------
+resolve_project() {
+  local p="$1"
+  if [ -z "$p" ]; then p="${JEVZH_PROJECT:-}"; fi
+  if [ -z "$p" ]; then p="$(git rev-parse --show-toplevel 2>/dev/null || true)"; fi
+  if [ -z "$p" ]; then p="$PWD"; fi
+  if [ -d "$p" ]; then (cd "$p" && pwd); else printf '%s' "$p"; fi
+}
+
+# 系统临时目录：$TMPDIR > $TEMP > $TMP > /tmp；Windows 路径经 cygpath 归一
+tmp_base() {
+  local t="${TMPDIR:-${TEMP:-${TMP:-/tmp}}}"
+  if command -v cygpath >/dev/null 2>&1; then
+    case "$t" in
+      [A-Za-z]:*|\\\\*) t="$(cygpath -u "$t" 2>/dev/null || printf '%s' "$t")" ;;
+    esac
+  fi
+  printf '%s' "$t"
+}
+
+# 项目绝对路径 hash：sha256sum 首段；缺失时 cksum 兜底
+path_hash() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    printf '%s' "$1" | sha256sum | awk '{print $1}'
+  else
+    printf '%s' "$1" | cksum | awk '{print $1}'
+  fi
+}
+
+PROJECT="$(resolve_project "$PROJECT_ARG")"
+STATE_PATH="$(tmp_base)/jevzh-$(path_hash "$PROJECT").state"
+
+# ---------------------------------------------------------------------------
+# 配置加载（环境变量 > <project>/.jevzh.json > 默认）
+# ---------------------------------------------------------------------------
+CFG_FILE="$PROJECT/.jevzh.json"
+
+json_field() { # $1=文件 $2=字段；缺失/异常输出空
+  node -e 'try{const fs=require("fs");const c=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const v=c[process.argv[2]];if(v!==undefined&&v!==null)process.stdout.write(String(v));}catch(e){}' \
+    "$1" "$2"
+}
+
+bool_word() { # 1/true/yes/on → 1；0/false/no/off 或无法识别 → 0
+  case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
+    1|true|yes|on) printf '1' ;;
+    *) printf '0' ;;
+  esac
+}
+
+JSON_BACKEND="$(json_field "$CFG_FILE" backend)"
+JSON_STRICT="$(json_field "$CFG_FILE" strict)"
+JSON_BASEURL="$(json_field "$CFG_FILE" baseUrl)"
+
+BACKEND_CFG="${JEVZH_BACKEND:-$JSON_BACKEND}"
+[ -n "$BACKEND_CFG" ] || BACKEND_CFG=auto
+case "$BACKEND_CFG" in
+  auto|cloud|local|off) ;;
+  *) BACKEND_CFG=auto ;;
+esac
+
+STRICT=0
+if [ -n "${JEVZH_STRICT+x}" ]; then
+  STRICT="$(bool_word "$JEVZH_STRICT")"
+elif [ -n "$JSON_STRICT" ]; then
+  STRICT="$(bool_word "$JSON_STRICT")"
+fi
+
+# baseUrl：显式 env > json；记录是否显式指定（auto 探测顺序用）
+URL_EXPLICIT=0
+if [ -n "${TYPESAFE_BASE_URL+x}" ] && [ -n "$TYPESAFE_BASE_URL" ]; then
+  BASE_URL="$TYPESAFE_BASE_URL"; URL_EXPLICIT=1
+elif [ -n "$JSON_BASEURL" ]; then
+  BASE_URL="$JSON_BASEURL"; URL_EXPLICIT=1
+else
+  BASE_URL="http://127.0.0.1:8000"
+fi
+BASE_URL="${BASE_URL%/}"
+
+API_KEY="${TYPESAFE_API_KEY:-}"
+
+# ---------------------------------------------------------------------------
+# HTTP 探测（2 秒超时）。优先 curl；缺失时用 node http/https 兜底。
+# 不引入 jq/python 依赖；JSON 一律 node -e 解析。
+# ---------------------------------------------------------------------------
+http_body_200() { # $1=url；2xx 时 body 输出到 stdout，否则非 0
+  if command -v curl >/dev/null 2>&1; then
+    curl -sf --max-time 2 "$1" 2>/dev/null
+  else
+    node -e '
+      const lib = process.argv[1].startsWith("https:") ? require("https") : require("http");
+      const req = lib.get(process.argv[1], { timeout: 2000 }, res => {
+        if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) { res.resume(); process.exit(1); }
+        let d = ""; res.on("data", c => d += c); res.on("end", () => process.stdout.write(d));
+      });
+      req.on("timeout", () => { req.destroy(); process.exit(1); });
+      req.on("error", () => process.exit(1));
+    ' "$1"
+  fi
+}
+
+http_reachable() { # $1=url；任何 HTTP 响应都算可达（云端只做存活探测），连接失败/超时非 0
+  if command -v curl >/dev/null 2>&1; then
+    curl -s -o /dev/null --max-time 2 "$1" 2>/dev/null
+  else
+    node -e '
+      const lib = process.argv[1].startsWith("https:") ? require("https") : require("http");
+      const req = lib.get(process.argv[1], { timeout: 2000 }, res => { res.resume(); process.exit(0); });
+      req.on("timeout", () => { req.destroy(); process.exit(1); });
+      req.on("error", () => process.exit(1));
+    ' "$1"
+  fi
+}
+
+# 云端探测端点选 https://api.typesafe.ai/ 根路径：
+# 仅做 2 秒存活探测（不发送请求体、不携带判定 payload，无副作用；任何 HTTP 响应
+# 即说明 DNS/TLS/主机可达），连接失败或超时即视为云端不可用。
+cloud_probe_url() {
+  if [ "$URL_EXPLICIT" = 1 ]; then printf '%s' "$BASE_URL"; else printf '%s' "https://api.typesafe.ai/"; fi
+}
+
+classify_health_body() { # stdin=health JSON → laya | heuristic | unknown
+  node -e 'let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{try{const j=JSON.parse(s);if(j.laya_installed===false){process.stdout.write("heuristic");}else if(j.laya_installed===true){process.stdout.write("laya");}else{process.stdout.write("laya");}}catch(e){process.stdout.write("unknown");}});'
+}
+
+probe_local_bridge() { # 成功输出 laya|heuristic；失败非 0
+  local body kind
+  body="$(http_body_200 "$BASE_URL/health" 2>/dev/null)" || return 1
+  kind="$(printf '%s' "$body" | classify_health_body)"
+  [ "$kind" = "unknown" ] && return 1
+  printf '%s' "$kind"
+}
+
+real_cloud_key() { [ -n "$API_KEY" ] && [ "$API_KEY" != "local" ]; }
+
+# 输出：cloud | laya | heuristic | none
+detect_backend() {
+  if [ "$BACKEND_CFG" = off ]; then
+    printf 'none'; return
+  fi
+  if [ "$BACKEND_CFG" = cloud ]; then
+    if http_reachable "$(cloud_probe_url)" 2>/dev/null; then printf 'cloud'; else printf 'none'; fi
+    return
+  fi
+  if [ "$BACKEND_CFG" = local ]; then
+    probe_local_bridge 2>/dev/null || printf 'none'
+    return
+  fi
+  # auto：显式 baseUrl 本地桥 → 真实 key 云端 → 默认 127.0.0.1:8000 本地桥
+  if [ "$URL_EXPLICIT" = 1 ]; then
+    local r
+    r="$(probe_local_bridge 2>/dev/null || true)"
+    if [ -n "$r" ]; then printf '%s' "$r"; return; fi
+  fi
+  if real_cloud_key; then
+    if http_reachable "$(cloud_probe_url)" 2>/dev/null; then printf 'cloud'; return; fi
+  fi
+  if [ "$URL_EXPLICIT" != 1 ]; then
+    local d
+    d="$(probe_local_bridge 2>/dev/null || true)"
+    if [ -n "$d" ]; then printf '%s' "$d"; return; fi
+  fi
+  printf 'none'
+}
+
+# ---------------------------------------------------------------------------
+# 工具探测（各门独立）
+# ---------------------------------------------------------------------------
+CANONICAL_TOOLS='jev-axi jev-scout jev-guard git-jev supercov limpet'
+MISSING_LIST=""
+
+add_missing() { MISSING_LIST="${MISSING_LIST}${1}"$'\n'; }
+
+if ! command -v jev-axi >/dev/null 2>&1; then add_missing jev-axi; fi
+if ! command -v jev-scout >/dev/null 2>&1; then add_missing jev-scout; fi
+if ! command -v jev-guard >/dev/null 2>&1; then add_missing jev-guard; fi
+if ! git jev --version >/dev/null 2>&1; then add_missing git-jev; fi
+if ! command -v supercov >/dev/null 2>&1; then add_missing supercov; fi
+if ! command -v limpet >/dev/null 2>&1; then add_missing limpet; fi
+
+MISSING_COUNT=$(printf '%s' "$MISSING_LIST" | grep -c . || true)
+
+classify_state() { # $1=backend
+  if [ "$BACKEND_CFG" = off ]; then printf 'DEGRADED'; return; fi
+  if [ "$MISSING_COUNT" -eq 6 ]; then printf 'DEGRADED'; return; fi
+  if [ "$MISSING_COUNT" -eq 0 ]; then
+    case "$1" in
+      cloud|laya) printf 'FULL' ;;
+      heuristic) printf 'LOCAL' ;;
+      *) printf 'PARTIAL' ;;
+    esac
+    return
+  fi
+  printf 'PARTIAL'
+}
+
+# ---------------------------------------------------------------------------
+# state 序列化（node 保证严格 JSON）
+# ---------------------------------------------------------------------------
+emit_state_json() { # $1=state $2=missing(多行) $3=backend $4=strict(0/1) $5=notified(0/1) $6=ts
+  node -e '
+    const a = process.argv.slice(1);
+    process.stdout.write(JSON.stringify({
+      state: a[0],
+      missingTools: a[1].split("\n").filter(Boolean),
+      backend: a[2],
+      strict: a[3] === "1",
+      notified: a[4] === "1",
+      ts: Number(a[5])
+    }));
+  ' "$1" "$2" "$3" "$4" "$5" "$6"
+}
+
+read_cached_notified() {
+  [ -f "$STATE_PATH" ] || { printf '0'; return; }
+  node -e 'try{const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(j.notified===true?"1":"0");}catch(e){process.stdout.write("0");}' "$STATE_PATH"
+}
+
+valid_state_json() {
+  node -e 'try{const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));if(!j.state||!Array.isArray(j.missingTools))process.exit(1);}catch(e){process.exit(1);}' "$1"
+}
+
+write_state() { # $1=完整 JSON
+  mkdir -p "$(dirname "$STATE_PATH")" 2>/dev/null || true
+  printf '%s' "$1" > "$STATE_PATH"
+}
+
+# --cached 命中路径（可同时 --mark-notified 更新标记）
+if [ "$USE_CACHED" = 1 ] && [ -f "$STATE_PATH" ] && valid_state_json "$STATE_PATH"; then
+  if [ "$MARK_NOTIFIED" = 1 ]; then
+    NEW_JSON="$(node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));j.notified=true;fs.writeFileSync(process.argv[1],JSON.stringify(j));process.stdout.write(JSON.stringify(j));' "$STATE_PATH")"
+  else
+    NEW_JSON="$(cat "$STATE_PATH")"
+  fi
+  if [ "$AS_JSON" = 1 ]; then printf '%s\n' "$NEW_JSON"; else
+    printf '[jev-readiness] 使用缓存（--cached），未重新探测：%s\n' "$STATE_PATH"
+  fi
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 执行探测并写缓存（notified 继承旧缓存，默认 false）
+# ---------------------------------------------------------------------------
+BACKEND="$(detect_backend)"
+STATE="$(classify_state "$BACKEND")"
+NOTIFIED="$(read_cached_notified)"
+[ "$MARK_NOTIFIED" = 1 ] && NOTIFIED=1
+TS="$(date +%s)"
+
+STATE_JSON="$(emit_state_json "$STATE" "$MISSING_LIST" "$BACKEND" "$STRICT" "$NOTIFIED" "$TS")"
+write_state "$STATE_JSON"
+
+if [ "$AS_JSON" = 1 ]; then
+  printf '%s\n' "$STATE_JSON"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 人类可读中文报告
+# ---------------------------------------------------------------------------
+install_hint() {
+  case "$1" in
+    jev-scout) printf 'cargo install jev-scout' ;;
+    jev-axi)   printf 'npm install -g jev-axi' ;;
+    git-jev)   printf 'git jev install' ;;
+    jev-guard) printf 'npm install -g jev-guard' ;;
+    supercov)  printf 'npm install -g supercov' ;;
+    limpet)    printf 'cargo install limpet（或 python3 ~/limpet/limpet.py）' ;;
+    *)         printf '-' ;;
+  esac
+}
+
+state_desc() {
+  case "$1" in
+    FULL)     printf '全量就绪：6 个工具齐备，云端 / Laya 421M 后端可达，全量门禁可用' ;;
+    LOCAL)    printf '本地就绪：6 个工具齐备，本地 heuristic 回退桥可达；门禁本地运行，阈值判定不变' ;;
+    PARTIAL)  printf '部分就绪：部分工具或后端缺失，各门独立降级，缺失的门转标准中文技能' ;;
+    DEGRADED) printf '已降级：工具全缺或 backend=off，所有门禁转标准中文技能（方法论仍可独立使用）' ;;
+  esac
+}
+
+backend_desc() {
+  case "$1" in
+    cloud)     printf '云端 TypeSafe 后端可达' ;;
+    laya)      printf '本地 Laya 421M 桥可达（%s）' "$BASE_URL" ;;
+    heuristic) printf '本地 heuristic 回退桥可达（%s）' "$BASE_URL" ;;
+    none)      printf '无可用后端（baseUrl=%s；local 可运行 scripts/serve-laya.py，cloud 需设置 TYPESAFE_API_KEY）' "$BASE_URL" ;;
+  esac
+}
+
+printf '==================================================\n'
+printf ' jev-superpowers-zh 门禁就绪检测\n'
+printf '==================================================\n'
+printf '项目：%s\n' "$PROJECT"
+printf '总体状态：%s（%s）\n' "$STATE" "$(state_desc "$STATE")"
+printf '工具清单（6 门）：\n'
+for t in $CANONICAL_TOOLS; do
+  if printf '%s' "$MISSING_LIST" | grep -qx "$t"; then
+    printf '  [缺失] %-9s 安装：%s\n' "$t" "$(install_hint "$t")"
+  else
+    printf '  [就绪] %s\n' "$t"
+  fi
+done
+printf '后端：%s → %s\n' "$BACKEND" "$(backend_desc "$BACKEND")"
+if [ "$STRICT" = 1 ]; then
+  printf '严格模式：开启（strict=true；环境型失败将以 exit 2 阻断）\n'
+else
+  printf '严格模式：关闭（strict=false；环境型失败软降级并提示转标准中文技能；JEVZH_STRICT=1 可开启）\n'
+fi
+printf '配置：backend=%s，缓存：%s\n' "$BACKEND_CFG" "$STATE_PATH"
+
+exit 0

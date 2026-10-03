@@ -3,6 +3,8 @@
 # Shell scripts and extensionless entry scripts shipped with skills
 *.sh text eol=lf
 skills/*/scripts/* text eol=lf
+# jev 门禁入口为无扩展名 bash 脚本（CRLF 会破坏 shebang）
+scripts/jev-* text eol=lf
 
 # Documentation
 *.md text eol=lf
