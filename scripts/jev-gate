@@ -198,19 +198,26 @@ case "$SUB" in
     if printf '%s' "$CAPTURED" | grep -Eiq 'verdict:[[:space:]]*block'; then
       reject "jev-guard 判定 verdict: block，该命令永远需要人工确认，任何模式都不自动执行。"
     fi
-    if printf '%s' "$CAPTURED" | grep -Eq 'PASS'; then exit 0; fi
+    # PASS 必须是独立 token（带字母边界）：BYPASSED/password/trespass 等含 pass
+    # 子串的输出不得放行；真实输出「PASS (destructive: 0.01)」仍命中。
+    if printf '%s' "$CAPTURED" | grep -Eq '(^|[^A-Za-z])PASS([^A-Za-z]|$)'; then exit 0; fi
     reject "无法识别 jev-guard 的判定输出（既无 PASS 也无 verdict: block），保守按否决处理，请人工确认。"
     ;;
 
   pick)
-    # 取最后一个 confidence（重跑场景以最后一次为准）；全角冒号兼容
-    PICK_VAL="$(printf '%s' "$CAPTURED" | node -e '
+    # 取最后一个 confidence（重跑场景以最后一次为准）；全角冒号兼容。
+    # 单次 node 同时完成 [0,1] 范围校验与分档，输出两行：<值> <档 A/B/C>；
+    # 越界（1.5、-0.2）与不可解析同罪：无输出即否决。
+    PICK_PARSED="$(printf '%s' "$CAPTURED" | node -e '
       let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
         const vals=[...s.matchAll(/confidence\s*[:：]\s*([0-9]+(?:\.[0-9]+)?)/gi)].map(m=>Number(m[1]));
-        if(vals.length) process.stdout.write(String(vals[vals.length-1]));
+        if(!vals.length) return;
+        const c=vals[vals.length-1];
+        if(!Number.isFinite(c)||c<0||c>1) return;
+        process.stdout.write(String(c)+"\n"+(c>=0.80?"A":(c>=0.50?"B":"C")));
       });')"
-    [ -n "$PICK_VAL" ] || reject "无法从 jev-axi pick 输出中解析 confidence，输出不可解析，保守否决。"
-    PICK_BAND="$(node -e 'const c=Number(process.argv[1]);process.stdout.write(c>=0.80?"A":(c>=0.50?"B":"C"));' "$PICK_VAL")"
+    [ -n "$PICK_PARSED" ] || reject "无法从 jev-axi pick 输出中解析合法 confidence（需 0≤c≤1），输出不可解析，保守否决。"
+    { read -r PICK_VAL; read -r PICK_BAND; } <<< "$PICK_PARSED"
     case "$PICK_BAND" in
       A) exit 0 ;;
       B)
@@ -241,7 +248,7 @@ case "$SUB" in
       -e '(^|[^0-9.])0[[:space:]]+verified[[:space:]]+crates?' \
       -e '(^|[^0-9.])0[[:space:]]+matching[[:space:]]+candidates?' \
       -e '(^|[^0-9.])0[[:space:]]+candidates?([^0-9]|$)' \
-      -e 'GATE[[:space:]]*FAILED'; then
+      -e '(^|[^A-Za-z])GATE[[:space:]]*FAILED'; then
       reject "jev-scout 报告 0 个经核实候选（门失败），禁止凭想象选依赖；请调整需求描述或扩大生态范围后重试。"
     fi
     exit 0

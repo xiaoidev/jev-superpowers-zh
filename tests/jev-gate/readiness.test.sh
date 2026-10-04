@@ -134,7 +134,6 @@ EOF
 # 组 1：无任何工具（真实 git 无 jev 子命令，git-jev 同样判缺）
 # ---------------------------------------------------------------------------
 P1="$TMP/p1"; mkproj "$P1"
-ENV_CLEAN='TYPESAFE_API_KEY= TYPESAFE_BASE_URL= JEVZH_BACKEND= JEVZH_STRICT='
 
 clear_state
 env -u TYPESAFE_BASE_URL -u TYPESAFE_API_KEY -u JEVZH_BACKEND -u JEVZH_STRICT \
@@ -330,6 +329,89 @@ assert_contains "$OUT" "http://127.0.0.1:8000" "7.10 报告含默认 baseUrl"
 # 参数错误非 0
 bash "$RD" --bogus >/dev/null 2>&1
 [ $? -ne 0 ] && ok "7.11 未知参数退出码非 0" || no "7.11 未知参数未报错"
+
+# ---------------------------------------------------------------------------
+# 组 8：baseUrl argv 注入 / scheme 白名单
+# --version（curl 选项注入）、not-a-url（畸形）、file:///etc/passwd（非 http(s)）
+# 在 auto/local 下都必须按不可达处理：rc=0、backend=none、stderr 无崩溃报错。
+# 此时 BIN 内六桩齐全，工具侧为 FULL 条件，backend 非法只能落 PARTIAL。
+# ---------------------------------------------------------------------------
+P8="$TMP/p8"; mkproj "$P8"
+for bad in '--version' 'not-a-url' 'file:///etc/passwd'; do
+  for be in auto local; do
+    clear_state
+    putcfg "$P8" "{\"backend\":\"$be\",\"baseUrl\":\"$bad\"}"
+    TYPESAFE_API_KEY= TYPESAFE_BASE_URL= rd_run "$P8"
+    assert_eq "$RC" "0" "8.注入 baseUrl=[$bad] backend=$be：退出码 0（不崩溃）"
+    assert_eq "$(jget backend <<<"$OUT")" "none" "8.注入 baseUrl=[$bad] backend=$be：backend=none"
+    assert_eq "$(jget state <<<"$OUT")" "PARTIAL" "8.注入 baseUrl=[$bad] backend=$be：不冒报 FULL/LOCAL（PARTIAL）"
+    if [ -s "$TMP/rd.err" ]; then
+      no "8.注入 baseUrl=[$bad] backend=$be：stderr 应无报错：$(cat "$TMP/rd.err")"
+    else
+      ok "8.注入 baseUrl=[$bad] backend=$be：stderr 干净"
+    fi
+  done
+done
+rm -f "$P8/.jevzh.json"
+
+# ---------------------------------------------------------------------------
+# 组 9：state 硬化——垃圾 / 伪造 / 字段非法一律判无效并回退实探；
+# --cached 命中无效 state 时同样回退（不报错退出），绝不信任伪造内容。
+# ---------------------------------------------------------------------------
+P9="$TMP/p9"; mkproj "$P9"; putcfg "$P9" '{"backend":"off"}'
+clear_state
+rd_run "$P9"
+SF9="$(state_file)"
+assert_eq "$(jget state <<<"$OUT")" "DEGRADED" "9.0 基线真实 state=DEGRADED"
+
+# 9.1 垃圾字符串、非 --cached：丢弃坏 state，重新探测成功
+printf 'this is not json at all' > "$SF9"
+rd_run "$P9"
+assert_eq "$RC" "0" "9.1 垃圾 state 非cached：rc 0"
+assert_eq "$(jget state <<<"$OUT")" "DEGRADED" "9.1 垃圾 state 非cached：按真实状态重探 DEGRADED"
+
+# 9.2 垃圾字符串 + --cached：同样回退实探（不是报错退出）
+printf 'this is not json at all' > "$SF9"
+rd_run "$P9" --cached
+assert_eq "$RC" "0" "9.2 垃圾 state --cached：回退实探 rc 0"
+assert_eq "$(jget state <<<"$OUT")" "DEGRADED" "9.2 垃圾 state --cached：DEGRADED"
+assert_eq "$(jget backend <<<"$OUT")" "none" "9.2 垃圾 state --cached：backend=none"
+
+# 9.3 形状合法但字段手工伪造（ts=1）：--cached 也不得信任
+printf '%s' '{"state":"FULL","missingTools":[],"backend":"cloud","strict":false,"notified":false,"ts":1}' > "$SF9"
+rd_run "$P9" --cached
+assert_eq "$(jget state <<<"$OUT")" "DEGRADED" "9.3 伪造 FULL/cloud ts=1 --cached：拒绝伪造回退 DEGRADED"
+assert_eq "$(jget backend <<<"$OUT")" "none" "9.3 伪造 state --cached：backend=none"
+TS93="$(jget ts <<<"$OUT")"
+if [ "$TS93" -ge 1000000000 ] 2>/dev/null; then ok "9.3 回退重探刷新真实 ts=$TS93"; else no "9.3 ts 未刷新为真实时间（got [$TS93]）"; fi
+
+# 9.4-9.7 字段级非法（其余字段合法、ts 为真实量级），--cached 均回退实探
+put_bad_state() { # $1=state|missing|ts|strict
+  node -e '
+    const fs=require("fs");
+    const j={state:"FULL",missingTools:[],backend:"cloud",strict:false,notified:false,ts:1780000000};
+    const kind=process.argv[2];
+    if(kind==="state")j.state="FUL";
+    if(kind==="missing")j.missingTools=[1,2];
+    if(kind==="ts")j.ts="soon";
+    if(kind==="strict")j.strict="yes";
+    fs.writeFileSync(process.argv[1],JSON.stringify(j));
+  ' "$SF9" "$1"
+}
+put_bad_state state; rd_run "$P9" --cached
+assert_eq "$(jget state <<<"$OUT")" "DEGRADED" "9.4 state 枚举拼错（FUL）--cached：回退 DEGRADED"
+put_bad_state missing; rd_run "$P9" --cached
+assert_eq "$(jget state <<<"$OUT")" "DEGRADED" "9.5 missingTools 含非字符串 --cached：回退 DEGRADED"
+assert_eq "$(jget backend <<<"$OUT")" "none" "9.5 回退后 backend=none"
+put_bad_state ts; rd_run "$P9" --cached
+assert_eq "$(jget state <<<"$OUT")" "DEGRADED" "9.6 ts 非数字 --cached：回退 DEGRADED"
+put_bad_state strict; rd_run "$P9" --cached
+assert_eq "$(jget state <<<"$OUT")" "DEGRADED" "9.7 strict 非布尔 --cached：回退 DEGRADED"
+
+# 9.8 回退后写入的是合法 state，随后 --cached 正常命中（ts 冻结，证明非一律忽略缓存）
+TS98="$(jget ts <<<"$OUT")"
+rd_run "$P9" --cached
+assert_eq "$(jget ts <<<"$OUT")" "$TS98" "9.8 回退写入的合法 state 可被 --cached 命中（ts 不变）"
 
 printf '\n==== readiness: PASS=%d FAIL=%d ====\n' "$PASS_COUNT" "$FAIL_COUNT"
 [ "$FAIL_COUNT" -eq 0 ] || exit 1

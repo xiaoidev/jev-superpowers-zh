@@ -76,13 +76,11 @@ STATE_PATH="$(tmp_base)/jevzh-$(path_hash "$PROJECT").state"
 
 # ---------------------------------------------------------------------------
 # 配置加载（环境变量 > <project>/.jevzh.json > 默认）
+# 一次 node 调用读出 backend/strict/baseUrl 三字段，并对最终生效的 base URL
+# 立即做 http(s) scheme 白名单校验（new URL + protocol），输出五行：
+#   <json backend> <json strict> <json baseUrl> <最终 baseUrl> <URL 合法 0/1>
 # ---------------------------------------------------------------------------
 CFG_FILE="$PROJECT/.jevzh.json"
-
-json_field() { # $1=文件 $2=字段；缺失/异常输出空
-  node -e 'try{const fs=require("fs");const c=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));const v=c[process.argv[2]];if(v!==undefined&&v!==null)process.stdout.write(String(v));}catch(e){}' \
-    "$1" "$2"
-}
 
 bool_word() { # 1/true/yes/on → 1；0/false/no/off 或无法识别 → 0
   case "$(printf '%s' "$1" | tr 'A-Z' 'a-z')" in
@@ -91,9 +89,31 @@ bool_word() { # 1/true/yes/on → 1；0/false/no/off 或无法识别 → 0
   esac
 }
 
-JSON_BACKEND="$(json_field "$CFG_FILE" backend)"
-JSON_STRICT="$(json_field "$CFG_FILE" strict)"
-JSON_BASEURL="$(json_field "$CFG_FILE" baseUrl)"
+CFG_LINE="$(node -e '
+  const fs = require("fs");
+  let backend = "", strict = "", baseUrl = "";
+  try {
+    const c = JSON.parse(fs.readFileSync(process.argv[1], "utf8"));
+    if (c !== null && typeof c === "object") {
+      if (c.backend !== undefined && c.backend !== null) backend = String(c.backend);
+      if (c.strict !== undefined && c.strict !== null) strict = String(c.strict);
+      if (c.baseUrl !== undefined && c.baseUrl !== null) baseUrl = String(c.baseUrl);
+    }
+  } catch (e) { /* 配置缺失/损坏：三字段均按空（落回默认），不报错 */ }
+  const envUrl = process.env.TYPESAFE_BASE_URL;
+  const finalUrl = (envUrl !== undefined && envUrl !== "")
+    ? envUrl
+    : (baseUrl || "http://127.0.0.1:8000");
+  let urlValid = 0;
+  try {
+    const u = new URL(finalUrl);
+    if (u.protocol === "http:" || u.protocol === "https:") urlValid = 1;
+  } catch (e) { urlValid = 0; } /* --version / not-a-url / file:// 等一律非法 */
+  process.stdout.write([backend, strict, baseUrl, finalUrl, String(urlValid)].join("\n"));
+' "$CFG_FILE")"
+{ read -r JSON_BACKEND; read -r JSON_STRICT; read -r JSON_BASEURL
+  read -r BASE_URL; read -r URL_VALID; } <<< "$CFG_LINE"
+[ -n "$URL_VALID" ] || URL_VALID=0
 
 BACKEND_CFG="${JEVZH_BACKEND:-$JSON_BACKEND}"
 [ -n "$BACKEND_CFG" ] || BACKEND_CFG=auto
@@ -112,46 +132,73 @@ fi
 # baseUrl：显式 env > json；记录是否显式指定（auto 探测顺序用）
 URL_EXPLICIT=0
 if [ -n "${TYPESAFE_BASE_URL+x}" ] && [ -n "$TYPESAFE_BASE_URL" ]; then
-  BASE_URL="$TYPESAFE_BASE_URL"; URL_EXPLICIT=1
+  URL_EXPLICIT=1
 elif [ -n "$JSON_BASEURL" ]; then
-  BASE_URL="$JSON_BASEURL"; URL_EXPLICIT=1
-else
-  BASE_URL="http://127.0.0.1:8000"
+  URL_EXPLICIT=1
 fi
 BASE_URL="${BASE_URL%/}"
 
 API_KEY="${TYPESAFE_API_KEY:-}"
 
 # ---------------------------------------------------------------------------
-# HTTP 探测（2 秒超时）。优先 curl；缺失时用 node http/https 兜底。
-# 不引入 jq/python 依赖；JSON 一律 node -e 解析。
+# HTTP 探测（2 秒超时）。不引入 jq/python 依赖；JSON 一律 node -e 解析。
+#
+# 实现选择：Windows/Git Bash（MINGW*/MSYS*/CYGWIN*）下 curl 对未监听的回环
+# 地址会吃满 --max-time（约 2s 才失败），node 则立即 ECONNREFUSED（亚秒级）；
+# 离线默认场景下两者相差近 10 倍。故 Windows 优先 node；非 Windows 保持
+# curl 优先、node 兜底。
+#
+# 安全：URL 一律先过 http(s) scheme 白名单（防 `--version` 类 argv 注入）；
+# curl 调用在 URL 前显式加 `--`；node 分支以 new URL 解析并校验 protocol，
+# 畸形 URL 直接判失败，不抛未捕获异常，也不把报错/帮助文本当作存活。
 # ---------------------------------------------------------------------------
+case "$(uname -s 2>/dev/null || printf 'unknown')" in
+  MINGW*|MSYS*|CYGWIN*) HTTP_PREFER_NODE=1 ;;
+  *) HTTP_PREFER_NODE=0 ;;
+esac
+
+http_url_allowed() { # 仅 http(s) 放行；--version / file:// / not-a-url 等直接判不可达
+  case "$1" in
+    http://*|https://*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+node_http_probe() { # $1=url  $2=body（2xx 回显 body）| reachable（任何 HTTP 响应即存活）
+  node -e '
+    let u;
+    try { u = new URL(process.argv[1]); }
+    catch (e) { process.exit(1); }
+    if (u.protocol !== "http:" && u.protocol !== "https:") process.exit(1);
+    const lib = u.protocol === "https:" ? require("https") : require("http");
+    const req = lib.get(u, { timeout: 2000 }, res => {
+      res.resume();
+      if (process.argv[2] === "reachable") process.exit(0);
+      if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) process.exit(1);
+      let d = "";
+      res.on("data", c => d += c);
+      res.on("end", () => process.stdout.write(d));
+    });
+    req.on("timeout", () => { req.destroy(); process.exit(1); });
+    req.on("error", () => process.exit(1));
+  ' "$1" "$2"
+}
+
 http_body_200() { # $1=url；2xx 时 body 输出到 stdout，否则非 0
-  if command -v curl >/dev/null 2>&1; then
-    curl -sf --max-time 2 "$1" 2>/dev/null
+  http_url_allowed "$1" || return 1
+  if [ "$HTTP_PREFER_NODE" = 1 ] || ! command -v curl >/dev/null 2>&1; then
+    node_http_probe "$1" body
   else
-    node -e '
-      const lib = process.argv[1].startsWith("https:") ? require("https") : require("http");
-      const req = lib.get(process.argv[1], { timeout: 2000 }, res => {
-        if (!res.statusCode || res.statusCode < 200 || res.statusCode >= 300) { res.resume(); process.exit(1); }
-        let d = ""; res.on("data", c => d += c); res.on("end", () => process.stdout.write(d));
-      });
-      req.on("timeout", () => { req.destroy(); process.exit(1); });
-      req.on("error", () => process.exit(1));
-    ' "$1"
+    curl -sf --max-time 2 -- "$1" 2>/dev/null
   fi
 }
 
 http_reachable() { # $1=url；任何 HTTP 响应都算可达（云端只做存活探测），连接失败/超时非 0
-  if command -v curl >/dev/null 2>&1; then
-    curl -s -o /dev/null --max-time 2 "$1" 2>/dev/null
+  http_url_allowed "$1" || return 1
+  if [ "$HTTP_PREFER_NODE" = 1 ] || ! command -v curl >/dev/null 2>&1; then
+    node_http_probe "$1" reachable
   else
-    node -e '
-      const lib = process.argv[1].startsWith("https:") ? require("https") : require("http");
-      const req = lib.get(process.argv[1], { timeout: 2000 }, res => { res.resume(); process.exit(0); });
-      req.on("timeout", () => { req.destroy(); process.exit(1); });
-      req.on("error", () => process.exit(1));
-    ' "$1"
+    curl -s -o /dev/null --max-time 2 -- "$1" 2>/dev/null
   fi
 }
 
@@ -182,20 +229,22 @@ detect_backend() {
     printf 'none'; return
   fi
   if [ "$BACKEND_CFG" = cloud ]; then
-    if http_reachable "$(cloud_probe_url)" 2>/dev/null; then printf 'cloud'; else printf 'none'; fi
+    if [ "$URL_VALID" = 1 ] && http_reachable "$(cloud_probe_url)" 2>/dev/null; then
+      printf 'cloud'; else printf 'none'; fi
     return
   fi
   if [ "$BACKEND_CFG" = local ]; then
-    probe_local_bridge 2>/dev/null || printf 'none'
+    if [ "$URL_VALID" = 1 ]; then probe_local_bridge 2>/dev/null || printf 'none'; else printf 'none'; fi
     return
   fi
   # auto：显式 baseUrl 本地桥 → 真实 key 云端 → 默认 127.0.0.1:8000 本地桥
-  if [ "$URL_EXPLICIT" = 1 ]; then
+  # URL 未过 scheme 白名单时跳过一切探测（非法 baseUrl 按不可达处理）
+  if [ "$URL_EXPLICIT" = 1 ] && [ "$URL_VALID" = 1 ]; then
     local r
     r="$(probe_local_bridge 2>/dev/null || true)"
     if [ -n "$r" ]; then printf '%s' "$r"; return; fi
   fi
-  if real_cloud_key; then
+  if real_cloud_key && [ "$URL_VALID" = 1 ]; then
     if http_reachable "$(cloud_probe_url)" 2>/dev/null; then printf 'cloud'; return; fi
   fi
   if [ "$URL_EXPLICIT" != 1 ]; then
@@ -240,38 +289,65 @@ classify_state() { # $1=backend
 # ---------------------------------------------------------------------------
 # state 序列化（node 保证严格 JSON）
 # ---------------------------------------------------------------------------
-emit_state_json() { # $1=state $2=missing(多行) $3=backend $4=strict(0/1) $5=notified(0/1) $6=ts
+emit_state_json() {
+  # $1=state $2=missing(多行) $3=backend $4=strict(0/1) $5=mark-notified(0/1)
+  # $6=ts $7=旧缓存路径：单次 node 内继承旧缓存 notified（损坏/缺失按 false），
+  # --mark-notified 置 true；注意此刻 write_state 尚未执行，读到的是旧文件。
   node -e '
+    const fs = require("fs");
     const a = process.argv.slice(1);
+    let notified = false;
+    try {
+      const old = JSON.parse(fs.readFileSync(a[6], "utf8"));
+      notified = (old.notified === true);
+    } catch (e) { notified = false; }
+    if (a[4] === "1") notified = true;
     process.stdout.write(JSON.stringify({
       state: a[0],
       missingTools: a[1].split("\n").filter(Boolean),
       backend: a[2],
       strict: a[3] === "1",
-      notified: a[4] === "1",
+      notified,
       ts: Number(a[5])
     }));
-  ' "$1" "$2" "$3" "$4" "$5" "$6"
+  ' "$1" "$2" "$3" "$4" "$5" "$6" "$7"
 }
 
-read_cached_notified() {
-  [ -f "$STATE_PATH" ] || { printf '0'; return; }
-  node -e 'try{const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));process.stdout.write(j.notified===true?"1":"0");}catch(e){process.stdout.write("0");}' "$STATE_PATH"
+valid_state_json() { # 完整结构校验；任一不符即无效（调用方一律回退实探，不报错）
+  node -e '
+    try {
+      const j = JSON.parse(require("fs").readFileSync(process.argv[1], "utf8"));
+      if (j === null || typeof j !== "object" || Array.isArray(j)) process.exit(1);
+      if (!["FULL","LOCAL","PARTIAL","DEGRADED"].includes(j.state)) process.exit(1);
+      if (!["cloud","laya","heuristic","none"].includes(j.backend)) process.exit(1);
+      if (typeof j.strict !== "boolean") process.exit(1);
+      if (typeof j.notified !== "boolean") process.exit(1);
+      // ts 必须是有限整数且为可信 epoch 秒：下界 1e9（2001-09）用于拒绝
+      // ts:1 这类「形状合法、字段手工伪造」的缓存（本脚本写不出 1970 年时间戳）
+      if (typeof j.ts !== "number" || !Number.isFinite(j.ts)
+          || !Number.isInteger(j.ts) || j.ts < 1000000000) process.exit(1);
+      if (!Array.isArray(j.missingTools)) process.exit(1);
+      if (j.missingTools.some(t => typeof t !== "string")) process.exit(1);
+      process.exit(0);
+    } catch (e) { process.exit(1); }
+  ' "$1"
 }
 
-valid_state_json() {
-  node -e 'try{const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));if(!j.state||!Array.isArray(j.missingTools))process.exit(1);}catch(e){process.exit(1);}' "$1"
-}
-
-write_state() { # $1=完整 JSON
-  mkdir -p "$(dirname "$STATE_PATH")" 2>/dev/null || true
-  printf '%s' "$1" > "$STATE_PATH"
+write_state() { # $1=完整 JSON；同目录 mktemp → chmod 600 → 写入 → mv 原子覆盖
+  local dir tmp
+  dir="$(dirname "$STATE_PATH")"
+  mkdir -p "$dir" 2>/dev/null || return 1
+  tmp="$(mktemp "$dir/.jevzh.state.XXXXXX" 2>/dev/null)" || return 1
+  chmod 600 "$tmp" 2>/dev/null || true
+  if ! printf '%s' "$1" > "$tmp"; then rm -f "$tmp"; return 1; fi
+  mv -f "$tmp" "$STATE_PATH"
 }
 
 # --cached 命中路径（可同时 --mark-notified 更新标记）
 if [ "$USE_CACHED" = 1 ] && [ -f "$STATE_PATH" ] && valid_state_json "$STATE_PATH"; then
   if [ "$MARK_NOTIFIED" = 1 ]; then
-    NEW_JSON="$(node -e 'const fs=require("fs");const j=JSON.parse(fs.readFileSync(process.argv[1],"utf8"));j.notified=true;fs.writeFileSync(process.argv[1],JSON.stringify(j));process.stdout.write(JSON.stringify(j));' "$STATE_PATH")"
+    NEW_JSON="$(node -e 'const j=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));j.notified=true;process.stdout.write(JSON.stringify(j));' "$STATE_PATH")"
+    write_state "$NEW_JSON" || true
   else
     NEW_JSON="$(cat "$STATE_PATH")"
   fi
@@ -286,11 +362,9 @@ fi
 # ---------------------------------------------------------------------------
 BACKEND="$(detect_backend)"
 STATE="$(classify_state "$BACKEND")"
-NOTIFIED="$(read_cached_notified)"
-[ "$MARK_NOTIFIED" = 1 ] && NOTIFIED=1
 TS="$(date +%s)"
 
-STATE_JSON="$(emit_state_json "$STATE" "$MISSING_LIST" "$BACKEND" "$STRICT" "$NOTIFIED" "$TS")"
+STATE_JSON="$(emit_state_json "$STATE" "$MISSING_LIST" "$BACKEND" "$STRICT" "$MARK_NOTIFIED" "$TS" "$STATE_PATH")"
 write_state "$STATE_JSON"
 
 if [ "$AS_JSON" = 1 ]; then

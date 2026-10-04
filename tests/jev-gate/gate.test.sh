@@ -53,6 +53,19 @@ no()   { FAIL_COUNT=$((FAIL_COUNT + 1)); printf 'not ok - %s\n' "$1" >&2; }
 assert_eq() { if [ "$1" = "$2" ]; then ok "$3"; else no "$3 (got [$1] want [$2])"; fi; }
 assert_contains() { case "$1" in *"$2"*) ok "$3";; *) no "$3 (missing [$2])";; esac; }
 
+# 与 jev-readiness 的 path_hash/tmp_base 同口径，定位某项目的就绪缓存文件
+state_path_for() {
+  local proj base h
+  proj="$(cd "$1" && pwd)"
+  base="${TMPDIR:-${TEMP:-${TMP:-/tmp}}}"
+  if command -v sha256sum >/dev/null 2>&1; then
+    h="$(printf '%s' "$proj" | sha256sum | awk '{print $1}')"
+  else
+    h="$(printf '%s' "$proj" | cksum | awk '{print $1}')"
+  fi
+  printf '%s/jevzh-%s.state' "$base" "$h"
+}
+
 # 伪造本地桥（laya），矩阵阶段供后端探测
 cat > "$TMP/bridge.js" <<'EOF'
 const http = require('http');
@@ -189,6 +202,11 @@ assert_eq "$RC" "2" "2.guard block → 2"
 assert_contains "$OUT" "判定否决" "2.guard block 否决文案"
 OUT="$(GUARD_OUT='??? unknown format' bash "$GATE" --project "$PA" guard x 2>&1)"; RC=$?
 assert_eq "$RC" "2" "2.guard 无法识别 → 保守 2"
+# PASS 必须是独立 token（字母边界）：BYPASSED / password 等含 pass 子串的输出不得放行
+OUT="$(GUARD_OUT='request was BYPASSED without verdict marker' bash "$GATE" --project "$PA" guard x 2>&1)"; RC=$?
+assert_eq "$RC" "2" "2.guard BYPASSED 含 PASS 子串 → 2"
+OUT="$(GUARD_OUT='password check skipped' bash "$GATE" --project "$PA" guard x 2>&1)"; RC=$?
+assert_eq "$RC" "2" "2.guard password 含 pass 子串 → 2"
 
 # pick 置信度四档
 OUT="$(AXI_OUT='confidence: 0.94' bash "$GATE" --project "$PA" pick '问题' 2>&1)"; RC=$?
@@ -206,6 +224,12 @@ assert_eq "$RC" "0" "2.pick 全角冒号 0.95 → 0"
 # 多个 confidence 取最后一个
 OUT="$(AXI_OUT=$'confidence: 0.20\nrerun confidence: 0.88' bash "$GATE" --project "$PA" pick q 2>&1)"; RC=$?
 assert_eq "$RC" "0" "2.pick 多值取最后 0.88 → 0"
+# confidence 必须落在 [0,1]：越界与不可解析同罪（留空→否决）；边界 1.00 合法
+OUT="$(AXI_OUT='confidence: 1.5' bash "$GATE" --project "$PA" pick '问题' 2>&1)"; RC=$?
+assert_eq "$RC" "2" "2.pick 1.5 越界 → 2"
+assert_contains "$OUT" "判定否决" "2.pick 1.5 否决文案"
+OUT="$(AXI_OUT='confidence: 1.00' bash "$GATE" --project "$PA" pick '问题' 2>&1)"; RC=$?
+assert_eq "$RC" "0" "2.pick 1.00 上边界合法 → 0"
 
 # check-hypothesis
 OUT="$(CHECK_OUT='hypothesis A, p: 0.81' bash "$GATE" --project "$PA" check-hypothesis 'h?' 2>&1)"; RC=$?
@@ -240,6 +264,11 @@ OUT="$(SCOUT_OUT='0 candidate' bash "$GATE" --project "$PA" scout 'need' 2>&1)";
 assert_eq "$RC" "2" "2.scout 行尾 0 candidate（单数）→ 2"
 OUT="$(SCOUT_OUT='search done: 0 candidates' bash "$GATE" --project "$PA" scout 'need' 2>&1)"; RC=$?
 assert_eq "$RC" "2" "2.scout 行尾 0 candidates（复数）→ 2"
+# GATE FAILED 必须带字母前导边界：WATERGATE / delegate（含 gate 子串）不得误判
+OUT="$(SCOUT_OUT='WATERGATE FAILED' bash "$GATE" --project "$PA" scout 'need' 2>&1)"; RC=$?
+assert_eq "$RC" "0" "2.scout WATERGATE FAILED → 0（字母边界）"
+OUT="$(SCOUT_OUT='delegate failed quietly' bash "$GATE" --project "$PA" scout 'need' 2>&1)"; RC=$?
+assert_eq "$RC" "0" "2.scout delegate failed quietly → 0（gate 子串边界）"
 
 # quality
 OUT="$(SUPERCOV_OUT='quality ok, 0 weak files' bash "$GATE" --project "$PA" quality src 2>&1)"; RC=$?
@@ -335,6 +364,29 @@ assert_eq "$RC" "0" "6.cache=1 strict+后端不可达：读缓存执行 → 0"
 OUT="$(JEVZH_STRICT=1 TYPESAFE_BASE_URL="$CLOSED_URL" \
   bash "$GATE" --project "$PC" pick q 2>&1)"; RC=$?
 assert_eq "$RC" "2" "6.无缓存 strict+后端不可达：阻断 → 2"
+
+# ---------------------------------------------------------------------------
+# 组 7：经 gate 端到端验证就绪 state 硬化——垃圾 / 伪造就绪缓存必须 fail-closed：
+# --cached 不信伪造（回退实探死桥，strict 环境型阻断 exit 2）；
+# 非 cached 遇垃圾 state 不崩溃，活桥重探成功后门照常执行（exit 0）。
+# ---------------------------------------------------------------------------
+SF_PC="$(state_path_for "$PC")"
+[ -f "$SF_PC" ] && ok "7.PC 就绪缓存可定位（与 readiness 同口径 hash）" \
+                  || no "7.PC 就绪缓存缺失：$SF_PC"
+
+# 7.1 形状合法但 ts=1 的伪造 FULL/cloud state：cache=1 也不得信任
+printf '%s' '{"state":"FULL","missingTools":[],"backend":"cloud","strict":false,"notified":false,"ts":1}' > "$SF_PC"
+OUT="$(JEVZH_GATE_CACHE=1 JEVZH_STRICT=1 TYPESAFE_BASE_URL="$CLOSED_URL" \
+  bash "$GATE" --project "$PC" pick q 2>&1)"; RC=$?
+assert_eq "$RC" "2" "7.伪造 state cache=1 strict+死桥：不信伪造 → 2"
+assert_contains "$OUT" "运行环境不满足" "7.伪造 state：按环境型失败阻断（非误跑门）"
+
+# 7.2 垃圾 state、非 cached、活桥：丢弃坏 state 重探成功，桩门正常执行
+printf 'this is not json at all' > "$SF_PC"
+OUT="$(TYPESAFE_BASE_URL="$BRIDGE_URL" \
+  bash "$GATE" --project "$PC" pick q 2>&1)"; RC=$?
+assert_eq "$RC" "0" "7.垃圾 state 非cached+活桥：重探不崩 → 0"
+assert_contains "$OUT" "confidence: 0.9" "7.垃圾 state：重探后真实执行门（桩输出透传）"
 
 printf '\n==== gate: PASS=%d FAIL=%d ====\n' "$PASS_COUNT" "$FAIL_COUNT"
 [ "$FAIL_COUNT" -eq 0 ] || exit 1
