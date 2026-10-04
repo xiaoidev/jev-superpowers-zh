@@ -85,6 +85,29 @@ no()   { FAIL_COUNT=$((FAIL_COUNT + 1)); printf 'not ok - %s\n' "$1" >&2; }
 assert_eq() { if [ "$1" = "$2" ]; then ok "$3"; else no "$3 (got [$1] want [$2])"; fi; }
 assert_contains() { case "$1" in *"$2"*) ok "$3";; *) no "$3 (missing [$2])";; esac; }
 assert_not_contains() { case "$1" in *"$2"*) no "$3 (unexpected [$2])";; *) ok "$3";; esac; }
+# 数值断言：$1 < $2（毫秒计时用，阈值故意宽松）
+assert_lt() { if [ "$1" -lt "$2" ]; then ok "$3 ($1ms < ${2}ms)"; else no "$3 ($1ms >= ${2}ms)"; fi; }
+
+# 保守阻断瞬断重试总次数（S-7：每次重试打印一行，结尾打印总数）
+HOOK_RETRIES=0
+
+# S-6：桥健康探活优先 curl，无 curl 用 node（node 为本链路硬依赖，必装）。
+http_health() { # $1=url
+  if command -v curl >/dev/null 2>&1; then
+    curl -sf --max-time 2 "$1" >/dev/null 2>&1
+  else
+    node -e '
+      const u = new URL(process.argv[1]);
+      const lib = u.protocol === "https:" ? require("https") : require("http");
+      const req = lib.get(u, { timeout: 2000 }, res => {
+        res.resume();
+        process.exit(res.statusCode === 200 ? 0 : 1);
+      });
+      req.on("timeout", () => { req.destroy(); process.exit(1); });
+      req.on("error", () => process.exit(1));
+    ' "$1"
+  fi
+}
 
 # hook JSON 输出解析：$1=JSON 文本 $2=JS 表达式（o 为解析对象），为真退出 0
 oj() {
@@ -111,7 +134,7 @@ if [ -n "$PY" ] && [ -f "$BRIDGE_PY" ]; then
   "$PY" -u "$BRIDGE_PY" --host 127.0.0.1 --port "$BPORT" >"$TMP/bridge.log" 2>&1 &
   BRIDGE_PID=$!
   for _ in $(seq 1 50); do
-    curl -sf --max-time 2 "http://127.0.0.1:$BPORT/health" >/dev/null 2>&1 && { BRIDGE_URL="http://127.0.0.1:$BPORT"; break; }
+    http_health "http://127.0.0.1:$BPORT/health" && { BRIDGE_URL="http://127.0.0.1:$BPORT"; break; }
     kill -0 "$BRIDGE_PID" 2>/dev/null || break
     sleep 0.2
   done
@@ -223,6 +246,54 @@ oj "$OUTB" 'o.hookSpecificOutput && typeof o.hookSpecificOutput.additionalContex
   && ok "2.readiness 失败：输出仍为合法 JSON（就绪段空兜底）" || no "2.readiness 失败兜底错误"
 assert_contains "$OUTB" "MARKER_5731" "2.readiness 失败：技能注入正文不受影响"
 
+# S-1：readiness 被同名包装脚本挂起（sleep 30）→ JEVZH_HOOK_TIMEOUT=2 下
+# 约 2s 返回、exit 0、JSON 合法、技能正文不受影响、stderr 有超时警告。
+FT1="$TMP/ft1"; mkdir -p "$FT1/hooks" "$FT1/skills/jev-using-superpowers" "$FT1/scripts"
+cp "$HOOKS/session-start" "$FT1/hooks/session-start"
+printf -- '---\nname: jev-using-superpowers\n---\n# fixture MARKER_FT1_S1\n' \
+  > "$FT1/skills/jev-using-superpowers/SKILL.md"
+printf '#!/usr/bin/env bash\nsleep 30\n' > "$FT1/scripts/jev-readiness"
+chmod +x "$FT1/scripts/jev-readiness"
+T_SS0=$(date +%s%3N)
+OUTT="$(cd "$P1" && env -u CURSOR_PLUGIN_ROOT -u COPILOT_CLI -u MUSE_PLUGIN_ROOT \
+  CLAUDE_PLUGIN_ROOT="$FT1" JEVZH_HOOK_TIMEOUT=2 bash "$FT1/hooks/session-start" 2>"$TMP/ft1.err")"
+RC=$?
+T_SS1=$(date +%s%3N)
+assert_eq "$RC" "0" "2.S-1 readiness 挂起：钩子不被卡死，exit 0"
+assert_lt "$((T_SS1 - T_SS0))" 10000 "2.S-1 约 2s 返回（默认阈值 10s，宽松 <10s）"
+oj "$OUTT" 'o.hookSpecificOutput && typeof o.hookSpecificOutput.additionalContext==="string"' \
+  && ok "2.S-1 超时：输出仍为合法 JSON（就绪段空兜底）" || no "2.S-1 超时 JSON 不合法"
+assert_contains "$OUTT" "MARKER_FT1_S1" "2.S-1 超时：技能注入正文不受影响"
+assert_contains "$(cat "$TMP/ft1.err" 2>/dev/null)" "超时" "2.S-1 超时：stderr 警告"
+
+# S-5：--mark-notified 仅在最终 JSON printf 成功后置位。
+# 手法：全新项目目录经提前关闭的管道（| true）消费 stdout，触发 SIGPIPE/EPIPE；
+# 再以 --cached 读缓存，notified 必须仍为 false。对照：正常输出后置为 true。
+# （Git for Windows 实测 5/5 稳定；若未来平台行为变化，断言会明确失败而非脆挂。）
+PMK1="$TMP/pmk1"; mkdir -p "$PMK1"
+printf '{"backend":"off","strict":false}' > "$PMK1/.jevzh.json"
+PMK2="$TMP/pmk2"; mkdir -p "$PMK2"
+printf '{"backend":"off","strict":false}' > "$PMK2/.jevzh.json"
+notified_of() { # $1=项目目录 → true/false（缓存已被 session-start 写入）
+  bash "$RD" --project "$1" --json --cached 2>/dev/null | node -e '
+    let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+      try { process.stdout.write(JSON.parse(s).notified === true ? "true" : "false"); }
+      catch(e) { process.stdout.write("none"); }
+    });'
+}
+# 缓存必须确由 session-start 写入（--cached 命中才打印「使用缓存」），防止
+# 「缓存不存在 → notified 读出来也是 false」造成假阳性。
+cache_present() { bash "$RD" --project "$1" --cached 2>/dev/null | grep -q '使用缓存'; }
+( cd "$PMK1" && set -o pipefail && env -u CURSOR_PLUGIN_ROOT -u COPILOT_CLI -u MUSE_PLUGIN_ROOT \
+  CLAUDE_PLUGIN_ROOT="$ROOT" bash "$HOOKS/session-start" 2>/dev/null | true )
+if cache_present "$PMK1"; then ok "2.S-5 管道关闭：就绪缓存已写入（前置条件成立）"; else no "2.S-5 缓存缺失，用例无效"; fi
+assert_eq "$(notified_of "$PMK1")" "false" "2.S-5 stdout 管道提前关闭：notified 不置位"
+OUTMK="$(cd "$PMK2" && env -u CURSOR_PLUGIN_ROOT -u COPILOT_CLI -u MUSE_PLUGIN_ROOT \
+  CLAUDE_PLUGIN_ROOT="$ROOT" bash "$HOOKS/session-start" 2>/dev/null)"
+oj "$OUTMK" 'o.hookSpecificOutput' \
+  && ok "2.S-5 对照：正常输出为合法 JSON" || no "2.S-5 对照输出不合法"
+assert_eq "$(notified_of "$PMK2")" "true" "2.S-5 正常输出成功：notified 置位"
+
 # ---------------------------------------------------------------------------
 # 组 3：pre-commit
 # ---------------------------------------------------------------------------
@@ -265,7 +336,10 @@ if [ -n "$BRIDGE_URL" ]; then
     RC=$?
     case "$RC:$OUT" in
       0:*'[PASS]'*) break ;;
-      2:*保守阻断*) sleep 1; continue ;;
+      2:*保守阻断*)
+        HOOK_RETRIES=$((HOOK_RETRIES + 1))   # S-7：重试可见
+        printf '# retry %d/4：[PASS] 用例遇「保守阻断」瞬断，1s 后重试\n' "$_try" >&2
+        sleep 1; continue ;;
       *) break ;;
     esac
   done
@@ -282,7 +356,10 @@ if [ -n "$BRIDGE_URL" ]; then
     RC=$?
     case "$RC:$OUT" in
       2:*判定否决*) break ;;
-      2:*保守阻断*) sleep 1; continue ;;
+      2:*保守阻断*)
+        HOOK_RETRIES=$((HOOK_RETRIES + 1))   # S-7：重试可见
+        printf '# retry %d/4：[FAIL] 用例遇「保守阻断」瞬断，1s 后重试\n' "$_try" >&2
+        sleep 1; continue ;;
       *) break ;;
     esac
   done
@@ -292,6 +369,10 @@ else
   no "3.serve-laya.py 桥未启动，跳过提交门真实执行用例（见 bridge.log）"
   no "3.同上"
   no "3.同上"
+fi
+# S-7：发生过重试则汇总总次数（无重试不打印，避免噪声）
+if [ "$HOOK_RETRIES" -gt 0 ]; then
+  printf '# 本轮「保守阻断」共重试 %d 次\n' "$HOOK_RETRIES"
 fi
 
 # backend=off 无桥：soft 降级 → 0 + [门禁降级]
@@ -313,6 +394,125 @@ assert_contains "$OUT" "WARN" "3.git 缺失 soft：含 WARN"
 OUT="$(cd "$POFF" && PATH="$NOGIT_PATH" env -u TYPESAFE_BASE_URL JEVZH_STRICT=1 bash "$HOOKS/pre-commit" <<< '{"tool_name":"Bash","tool_input":{"command":"git commit -m x"}}' 2>&1)"
 RC=$?
 assert_eq "$RC" "2" "3.git 缺失 strict：阻断 → 2"
+
+# ---------------------------------------------------------------------------
+# 组 3b：I-1 真实宿主形状载荷（node JSON.stringify 生成；旧 grep 抠字段会在
+# 转义引号处截断，以下前三条曾被静默绕过）。POFF backend=off：进门必现
+# [门禁降级]；不进门则输出为空。
+# ---------------------------------------------------------------------------
+P_ESC="$(node -e 'process.stdout.write(JSON.stringify({tool_input:{command:"echo \"x\"; git commit -m y"}}))')"
+P_PRETTY="$(node -e 'let s=JSON.stringify({tool_input:{command:"git commit -m y"}},null,2);process.stdout.write(s.replace("\"command\":","\"command\":\n"))')"
+P_STATUS="$(node -e 'process.stdout.write(JSON.stringify({tool_input:{command:"git status"}}))')"
+P_ECHO="$(node -e 'process.stdout.write(JSON.stringify({tool_input:{command:"echo commit-done"}}))')"
+P_BAD='{ "tool_input": { "command": "git commit -m x", "broken": '
+run_poff() { # $1=stdin 载荷；回填 OUT/RC
+  OUT="$(cd "$POFF" && env -u TYPESAFE_BASE_URL bash "$HOOKS/pre-commit" <<< "$1" 2>&1)"
+  RC=$?
+}
+
+run_poff "$P_ESC"
+assert_eq "$RC" "0" "3.I-1 转义引号复合命令：进门 soft 降级 → 0"
+assert_contains "$OUT" "[门禁降级]" "3.I-1 转义引号：门确实执行（[门禁降级]）"
+run_poff "$P_PRETTY"
+assert_eq "$RC" "0" "3.I-1 pretty 打印（值前换行）：进门 → 0"
+assert_contains "$OUT" "[门禁降级]" "3.I-1 pretty：门确实执行"
+run_poff "$P_BAD"
+assert_eq "$RC" "0" "3.I-1 非法 JSON 含 commit：fail-closed 进门 → 0"
+assert_contains "$OUT" "[门禁降级]" "3.I-1 非法 JSON：门确实执行"
+run_poff "$P_STATUS"
+assert_eq "$RC" "0" "3.I-1 git status：非提交命令不进门 → 0"
+assert_not_contains "$OUT" "[门禁降级]" "3.I-1 git status：无门控输出"
+run_poff "$P_ECHO"
+assert_eq "$RC" "0" "3.I-1 echo commit-done：无 git 语义不进门 → 0"
+assert_not_contains "$OUT" "[门禁降级]" "3.I-1 commit-done：预筛命中后由 node 正则否决"
+
+# node 缺失（立即 127 的 stub）：预筛命中后解析不可用 → fail-closed 进门。
+# 全链路 node 不可用下 jev-gate 契约为「就绪状态读取失败…保守阻断」exit 2。
+printf '#!/usr/bin/env bash\nexit 127\n' > "$BIN/node"
+chmod +x "$BIN/node"
+OUT="$(cd "$POFF" && env -u TYPESAFE_BASE_URL PATH="$BIN:$CLEAN_PATH" bash "$HOOKS/pre-commit" <<< "$P_ESC" 2>&1)"
+RC=$?
+rm -f "$BIN/node"
+assert_eq "$RC" "2" "3.I-1 node 127 stub + 提交载荷：fail-closed 进门 → 2"
+assert_contains "$OUT" "保守阻断" "3.I-1 node 缺失：jev-gate 保守阻断（非静默放行）"
+
+# S-4：1.1MB 纯噪声（不含 commit/push 字样）超 1MB 上限 → fail-closed 进门，
+# 且快速完成（head 封顶读取，不做全文正则）。
+BIG="$(node -e 'process.stdout.write("a".repeat(1153434))')"
+T_BIG0=$(date +%s%3N)
+OUT="$(cd "$POFF" && env -u TYPESAFE_BASE_URL bash "$HOOKS/pre-commit" <<< "$BIG" 2>&1)"
+RC=$?
+T_BIG1=$(date +%s%3N)
+assert_eq "$RC" "0" "3.S-4 1.1MB 非提交噪声：超限 fail-closed 进门 → 0"
+assert_contains "$OUT" "[门禁降级]" "3.S-4 超限载荷：门确实执行"
+assert_lt "$((T_BIG1 - T_BIG0))" 10000 "3.S-4 超限载荷快速返回（宽松 <10s）"
+
+# ---------------------------------------------------------------------------
+# 组 3c：S-2 strict 纯本地判定（env > .jevzh.json；不再每提交全量探测）
+# ---------------------------------------------------------------------------
+PST="$TMP/pstrict"; mkdir -p "$PST"
+printf '{"backend":"off","strict":true}' > "$PST/.jevzh.json"
+PENV0="$TMP/penv0"; mkdir -p "$PENV0"
+printf '{"backend":"off","strict":true}' > "$PENV0/.jevzh.json"
+PSW="$TMP/pswitch"; mkdir -p "$PSW"
+printf '{"backend":"off","strict":false}' > "$PSW/.jevzh.json"
+COMMIT_PAYLOAD='{"tool_name":"Bash","tool_input":{"command":"git commit -m x"}}'
+
+# json strict:true 无 env → strict → 2（冷缓存：readiness 回退实探一次）
+OUT="$(cd "$PST" && env -u TYPESAFE_BASE_URL bash "$HOOKS/pre-commit" <<< "$COMMIT_PAYLOAD" 2>&1)"
+RC=$?
+assert_eq "$RC" "2" "3.S-2 .jevzh.json strict:true（无 env）：strict 阻断 → 2"
+
+# env JEVZH_STRICT=0 覆盖 json true → soft → 0
+OUT="$(cd "$PENV0" && env -u TYPESAFE_BASE_URL JEVZH_STRICT=0 bash "$HOOKS/pre-commit" <<< "$COMMIT_PAYLOAD" 2>&1)"
+RC=$?
+assert_eq "$RC" "0" "3.S-2 JEVZH_STRICT=0 覆盖 json true：soft → 0"
+assert_contains "$OUT" "[门禁降级]" "3.S-2 env=0：按 soft 降级"
+
+# soft 缓存写过后，JEVZH_STRICT=1 立即生效（不被旧缓存 strict=false 卡住）
+OUT="$(cd "$PSW" && env -u TYPESAFE_BASE_URL bash "$HOOKS/pre-commit" <<< "$COMMIT_PAYLOAD" 2>&1)"
+RC=$?
+assert_eq "$RC" "0" "3.S-2 切换用例：先 soft 写缓存 → 0"
+OUT="$(cd "$PSW" && env -u TYPESAFE_BASE_URL JEVZH_STRICT=1 bash "$HOOKS/pre-commit" <<< "$COMMIT_PAYLOAD" 2>&1)"
+RC=$?
+assert_eq "$RC" "2" "3.S-2 同项目随即 JEVZH_STRICT=1：立即 strict → 2（缓存一致性纠偏）"
+
+# ---------------------------------------------------------------------------
+# 组 3d：S-1 外层超时（JEVZH_HOOK_TIMEOUT=2s 加速；夹具插件树替换脚本）
+# 手法说明：PLUGIN_ROOT 由钩子自身路径推导、无法 PATH 注入，故仿组 2 既有
+# FP 夹具建最小插件树（hooks/ + skills/ + scripts/），把 jev-readiness 或
+# jev-gate 换成 sleep 30 的同名脚本——比整树复制简单且与既有用例同构。
+# ---------------------------------------------------------------------------
+FT_RD="$TMP/ftrd"; mkdir -p "$FT_RD/hooks" "$FT_RD/scripts"
+cp "$HOOKS/pre-commit" "$FT_RD/hooks/pre-commit"
+# 钩子自身不再直接调 jev-readiness（S-2 直读缓存文件），故夹具须同时放入真实
+# jev-gate：gate 经其内部 jev-readiness（sleep 30 stub）触达超时，被钩子的
+# run_to 2s 整体收割（rc=124）。
+cp "$GATE" "$FT_RD/scripts/jev-gate"
+printf '#!/usr/bin/env bash\nsleep 30\n' > "$FT_RD/scripts/jev-readiness"
+chmod +x "$FT_RD/scripts/jev-readiness"
+T_TO0=$(date +%s%3N)
+OUT="$(cd "$POFF" && env -u TYPESAFE_BASE_URL JEVZH_HOOK_TIMEOUT=2 \
+  bash "$FT_RD/hooks/pre-commit" <<< "$COMMIT_PAYLOAD" 2>"$TMP/ftrd.err")"
+RC=$?
+T_TO1=$(date +%s%3N)
+assert_eq "$RC" "0" "3.S-1 jev-readiness 挂起（经 gate 触达）：2s 超时 soft 放行 → 0"
+assert_lt "$((T_TO1 - T_TO0))" 10000 "3.S-1 readiness 超时约 2s 返回（宽松 <10s）"
+assert_contains "$(cat "$TMP/ftrd.err" 2>/dev/null)" "超时" "3.S-1 readiness 超时：stderr 警告"
+
+FT_GT="$TMP/ftgt"; mkdir -p "$FT_GT/hooks" "$FT_GT/scripts"
+cp "$HOOKS/pre-commit" "$FT_GT/hooks/pre-commit"
+cp "$RD" "$FT_GT/scripts/jev-readiness"
+printf '#!/usr/bin/env bash\nsleep 30\n' > "$FT_GT/scripts/jev-gate"
+chmod +x "$FT_GT/scripts/jev-gate"
+T_TO0=$(date +%s%3N)
+OUT="$(cd "$POFF" && env -u TYPESAFE_BASE_URL JEVZH_HOOK_TIMEOUT=2 \
+  bash "$FT_GT/hooks/pre-commit" <<< "$COMMIT_PAYLOAD" 2>"$TMP/ftgt.err")"
+RC=$?
+T_TO1=$(date +%s%3N)
+assert_eq "$RC" "0" "3.S-1 jev-gate 挂起：2s 超时 soft 放行 → 0"
+assert_lt "$((T_TO1 - T_TO0))" 10000 "3.S-1 gate 超时约 2s 返回（宽松 <10s）"
+assert_contains "$(cat "$TMP/ftgt.err" 2>/dev/null)" "超时" "3.S-1 gate 超时：stderr 警告"
 
 # ---------------------------------------------------------------------------
 # 组 4：stop（此后撤掉 git stub，让真实 git 接管；limpet 按需 stub）
@@ -395,6 +595,48 @@ printf '#!/usr/bin/env bash\nexit 1\n' > "$R7/scripts/test.sh"
 OUT="$(cd "$R7" && PATH="$CLEAN_PATH" bash "$HOOKS/stop" 2>&1)"; RC=$?
 assert_eq "$RC" "0" "4.非 git 目录：前两段跳过 + limpet 缺失 soft → 0"
 assert_not_contains "$OUT" "test.sh" "4.非 git 目录：不执行 test.sh 检查"
+
+# 4.8 S-3 strict 聚合：脏树 + test.sh 失败同时命中，不命中第一个就退出，
+# 统一输出包含两类问题文案并 exit 2（limpet stub 正常通过，不掺杂第三项）。
+R8="$TMP/r8"; make_repo "$R8" true
+mkdir -p "$R8/scripts"
+printf '#!/usr/bin/env bash\nexit 1\n' > "$R8/scripts/test.sh"
+( cd "$R8" && git add scripts/test.sh && git commit -qm init )
+echo dirty > "$R8/sneaky.txt"
+( cd "$R8" && JEVZH_STRICT=1 bash "$RD" --project "$R8" --json >/dev/null 2>&1 )
+OUT="$(cd "$R8" && JEVZH_STRICT=1 bash "$HOOKS/stop" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "4.S-3 strict 脏树+test.sh 失败：聚合后 exit 2"
+assert_contains "$OUT" "未提交" "4.S-3 聚合输出含「未提交变更」"
+assert_contains "$OUT" "test.sh" "4.S-3 聚合输出含「test.sh」"
+assert_contains "$OUT" "2 项" "4.S-3 聚合输出标注问题总数=2"
+
+# 4.9 S-1 limpet 门超时（夹具插件树：真实 jev-readiness 读缓存，jev-gate 换
+# sleep 30）：soft 环境型 WARN exit 0；strict 环境型 exit 2；均约 2s 返回。
+FT4="$TMP/ft4"; mkdir -p "$FT4/hooks" "$FT4/scripts"
+cp "$HOOKS/stop" "$FT4/hooks/stop"
+cp "$RD" "$FT4/scripts/jev-readiness"
+printf '#!/usr/bin/env bash\nsleep 30\n' > "$FT4/scripts/jev-gate"
+chmod +x "$FT4/scripts/jev-gate"
+
+R9="$TMP/r9"; make_repo "$R9" false
+( cd "$R9" && git commit -qm init --allow-empty )
+warm_state "$R9"
+T_LP0=$(date +%s%3N)
+OUT="$(cd "$R9" && JEVZH_HOOK_TIMEOUT=2 bash "$FT4/hooks/stop" 2>&1)"; RC=$?
+T_LP1=$(date +%s%3N)
+assert_eq "$RC" "0" "4.S-1 limpet 门超时 soft：环境型 WARN 放行 → 0"
+assert_contains "$OUT" "超时" "4.S-1 soft 超时：含超时警告"
+assert_lt "$((T_LP1 - T_LP0))" 10000 "4.S-1 soft 超时约 2s 返回（宽松 <10s）"
+
+R10="$TMP/r10"; make_repo "$R10" true
+( cd "$R10" && git commit -qm init --allow-empty )
+( cd "$R10" && JEVZH_STRICT=1 bash "$RD" --project "$R10" --json >/dev/null 2>&1 )
+T_LP0=$(date +%s%3N)
+OUT="$(cd "$R10" && JEVZH_STRICT=1 JEVZH_HOOK_TIMEOUT=2 bash "$FT4/hooks/stop" 2>&1)"; RC=$?
+T_LP1=$(date +%s%3N)
+assert_eq "$RC" "2" "4.S-1 limpet 门超时 strict：环境型阻断 → 2"
+assert_contains "$OUT" "超时" "4.S-1 strict 超时：聚合输出含超时项"
+assert_lt "$((T_LP1 - T_LP0))" 10000 "4.S-1 strict 超时约 2s 返回（宽松 <10s）"
 
 # ---------------------------------------------------------------------------
 # 组 5：run-hook.cmd polyglot 结构 + Windows cmd.exe 实测

@@ -110,9 +110,27 @@ PORT="$(pick_port)"
 BRIDGE_PID=$!
 BASE="http://127.0.0.1:$PORT"
 
+# S-6：健康探活优先 curl，无 curl 用 node（node 为本链路硬依赖，必装）。
+http_health() { # $1=url
+  if command -v curl >/dev/null 2>&1; then
+    curl -sf --max-time 2 "$1" >/dev/null 2>&1
+  else
+    node -e '
+      const u = new URL(process.argv[1]);
+      const lib = u.protocol === "https:" ? require("https") : require("http");
+      const req = lib.get(u, { timeout: 2000 }, res => {
+        res.resume();
+        process.exit(res.statusCode === 200 ? 0 : 1);
+      });
+      req.on("timeout", () => { req.destroy(); process.exit(1); });
+      req.on("error", () => process.exit(1));
+    ' "$1"
+  fi
+}
+
 READY=0
 for _ in $(seq 1 50); do
-  if curl -sf --max-time 2 "$BASE/health" >/dev/null 2>&1; then READY=1; break; fi
+  if http_health "$BASE/health"; then READY=1; break; fi
   kill -0 "$BRIDGE_PID" 2>/dev/null || break
   sleep 0.2
 done

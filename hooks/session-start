@@ -15,6 +15,33 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
+# ---------------------------------------------------------------------------
+# 跨平台超时包装（S-1）：优先 timeout（Git for Windows / Linux 自带），
+# 其次 gtimeout（macOS coreutils），都没有则裸执行（保持现状）。
+# JEVZH_HOOK_TIMEOUT（秒）可覆盖默认阈值，仅供宿主自调/测试加速。
+# 用法：run_to <秒> <命令...>；超时返回 124（被 -9 收割时 137）。
+# session-start 的 jev-readiness 调用 10s 封顶：超时打 WARN 后继续，绝不
+# 卡住会话启动（soft 语义，就绪段回退空字符串）。
+# ---------------------------------------------------------------------------
+JEVZH_TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then
+  JEVZH_TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+  JEVZH_TIMEOUT_BIN="gtimeout"
+fi
+run_to() {
+  local secs="$1"; shift
+  [ -n "${JEVZH_HOOK_TIMEOUT:-}" ] && secs="$JEVZH_HOOK_TIMEOUT"
+  if [ -n "$JEVZH_TIMEOUT_BIN" ]; then
+    "$JEVZH_TIMEOUT_BIN" "$secs" "$@"
+  else
+    "$@"
+  fi
+}
+
+# 就绪探测实际生效的超时秒数（仅用于对外文案；run_to 内部自行解析覆盖）。
+SS_TIMEOUT_SECS="${JEVZH_HOOK_TIMEOUT:-10}"
+
 # Read jev-using-superpowers content (the Jev router, not the non-Jev original)
 using_superpowers_content=$(cat "${PLUGIN_ROOT}/skills/jev-using-superpowers/SKILL.md" 2>&1 || echo "Error reading jev-using-superpowers skill")
 
@@ -37,10 +64,13 @@ escape_for_json() {
 readiness_section=""
 PROJECT_DIR="${PWD:-.}"
 state_json=""
-if state_json="$(bash "$PLUGIN_ROOT/scripts/jev-readiness" --project "$PROJECT_DIR" --json 2>/dev/null)"; then
-  :
-else
-  state_json=""
+need_mark=0
+rd_rc=0
+# S-1：readiness 10s 封顶，超时/失败均回退空段，不影响会话启动。
+# 注意：不可用 `if ! x=$(...); then rc=$?` —— `!` 会把 $? 重置为取反后的 0。
+state_json="$(run_to 10 bash "$PLUGIN_ROOT/scripts/jev-readiness" --project "$PROJECT_DIR" --json 2>/dev/null)" || rd_rc=$?
+if [ "$rd_rc" = "124" ] || [ "$rd_rc" = "137" ]; then
+  echo "WARN session-start：jev-readiness 就绪探测超时（${SS_TIMEOUT_SECS}s），本次跳过门禁就绪段（不影响会话启动）。" >&2
 fi
 
 if [ -n "$state_json" ]; then
@@ -97,10 +127,10 @@ if [ -n "$state_json" ]; then
 
     if [ -n "$section_text" ]; then
       readiness_section="$section_text"
-      # 完整提示每会话仅一次：仅在完整段渲染成功后置位 notified（失败忽略）。
+      # 完整提示每会话仅一次：此处只置需求标记；真正 --mark-notified 延后到
+      # 最终 JSON printf 成功之后（S-5），输出失败（如管道关闭）不得置位。
       if [ "$section_mode" = "full" ]; then
-        bash "$PLUGIN_ROOT/scripts/jev-readiness" --project "$PROJECT_DIR" \
-          --cached --mark-notified >/dev/null 2>&1 || true
+        need_mark=1
       fi
     fi
   fi
@@ -120,6 +150,10 @@ session_context="<EXTREMELY_IMPORTANT>\nYou have superpowers.\n\n**Below is the 
 #
 # Uses printf instead of heredoc to work around bash 5.3+ heredoc hang.
 # See: https://github.com/obra/superpowers/issues/571
+#
+# 捕获 printf 管道的退出码（pipefail 下任一段失败即非 0，典型为宿主提前关闭
+# stdout 触发 SIGPIPE）；输出失败则不置位 notified（S-5），直接退出。
+json_rc=0
 if [ -n "${CURSOR_PLUGIN_ROOT:-}" ]; then
   # Cursor sets CURSOR_PLUGIN_ROOT (may also set CLAUDE_PLUGIN_ROOT)
   printf '{\n  "additional_context": "%s"\n}\n' "$session_context" | cat
@@ -132,6 +166,17 @@ elif [ -n "${MUSE_PLUGIN_ROOT:-}" ]; then
 else
   # Copilot CLI (sets COPILOT_CLI=1) or unknown platform — SDK standard format
   printf '{\n  "additionalContext": "%s"\n}\n' "$session_context" | cat
+fi || json_rc=$?
+
+if [ "$json_rc" -ne 0 ]; then
+  # 输出未成功送达（如管道提前关闭）：本次不置位 notified，下次仍给完整段。
+  exit 0
+fi
+
+# S-5：仅在最终 JSON 输出成功后置位（10s 封顶，失败忽略不影响退出）。
+if [ "$need_mark" = "1" ]; then
+  run_to 10 bash "$PLUGIN_ROOT/scripts/jev-readiness" --project "$PROJECT_DIR" \
+    --cached --mark-notified >/dev/null 2>&1 || true
 fi
 
 exit 0
