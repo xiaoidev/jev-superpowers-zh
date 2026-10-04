@@ -102,3 +102,36 @@ test('doctor 只读：运行前后项目树 sha 不变', () => {
     rmFixture(dir);
   }
 });
+
+test('R-1：项目 .jevzh.json 损坏 -> doctor 显式报告并 exit 1（门禁静默按默认配置的风险可见）', () => {
+  const dir = mkFixture('jevzh-doctor-badjson-');
+  fs.mkdirSync(path.join(dir, '.claude'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.jevzh.json'), '{ "strict": true, ');
+  try {
+    const r = run(['doctor', '--tool', 'claude'], { cwd: dir, env: { JEVZH_BACKEND: 'off' } });
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    assert.notEqual(r.status, 2, '配置损坏是 WARN 级，不是 BLOCK');
+    const out = r.stdout + r.stderr;
+    assert.match(out, /配置文件损坏/);
+    assert.match(out, /\.jevzh\.json/);
+    assert.match(out, /门禁将按默认配置运行/);
+    // doctor 只读：坏文件原样保留
+    assert.equal(readText(path.join(dir, '.jevzh.json')), '{ "strict": true, ');
+  } finally {
+    rmFixture(dir);
+  }
+});
+
+test('R-1：健康安装（.jevzh.json 合法）-> doctor 不输出配置损坏条目，exit 0', () => {
+  const dir = mkFixture('jevzh-doctor-goodjson-');
+  try {
+    const r0 = run(['--tool', 'claude'], { cwd: dir });
+    assert.equal(r0.status, 0, r0.stdout + r0.stderr);
+    assert.ok(exists(path.join(dir, '.jevzh.json')));
+    const r = run(['doctor', '--tool', 'claude'], { cwd: dir });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.doesNotMatch(r.stdout + r.stderr, /配置文件损坏/);
+  } finally {
+    rmFixture(dir);
+  }
+});

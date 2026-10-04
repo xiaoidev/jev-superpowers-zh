@@ -26,7 +26,7 @@ import {
   copyFileSync, lstatSync, realpathSync, rmSync, chmodSync, renameSync,
 } from 'node:fs';
 import { resolve, dirname, join, sep, basename, isAbsolute } from 'node:path';
-import { randomBytes } from 'node:crypto';
+import { randomBytes, createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -1369,32 +1369,79 @@ function isInsideDir(baseDir, abs) {
   return p === b || p.startsWith(b + sep);
 }
 
-// 有边界的英文 jev / obra 旧段切除（保守）：ATX 标题 + 段内至少 2 个高置信特征。
-// 边界不可判定 -> unresolvable，调用方 WARN 整文件保留。
+// 朴素 ATX 标题扫描（围栏感知）：
+//   - 识别 0~3 空格缩进的 1~6 级 ATX 标题，返回相对原文的字符下标；
+//   - 跳过 ``` / ~~~ 代码围栏内的行（围栏长度 >=3、同类围栏且长度不短于开围栏
+//     才算闭合，闭合围栏不得带 info string），避免把代码示例里的 markdown 标题
+//     误当边界；
+//   - 已知限制：不解析跨行 inline code 反引号段（极少见），这类行理论上可能被
+//     误判为标题；与 cutPairedSections / cutLegacyZhMarkedSection 同属保守的
+//     行级扫描，切除前仍有「段内 >=2 高置信特征」门槛兜底。
+function scanAtxHeadings(content) {
+  const heads = [];
+  const fenceRe = /^[ \t]{0,3}(`{3,}|~{3,})(.*)$/;
+  const lines = content.split('\n');
+  let offset = 0;
+  let fence = null; // { char: '`' | '~', len: number }
+  for (const raw of lines) {
+    const line = raw.replace(/\r$/, '');
+    if (fence) {
+      const fm = fenceRe.exec(line);
+      if (fm && fm[1][0] === fence.char && fm[1].length >= fence.len && fm[2].trim() === '') {
+        fence = null;
+      }
+    } else {
+      const fm = fenceRe.exec(line);
+      if (fm) {
+        fence = { char: fm[1][0], len: fm[1].length };
+      } else {
+        const hm = /^[ \t]{0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$/.exec(line);
+        if (hm) {
+          const text = String(hm[2] || '').replace(/[ \t]+#+[ \t]*$/, '').trim();
+          heads.push({ index: offset, level: hm[1].length, text });
+        }
+      }
+    }
+    offset += raw.length + 1; // \n 本身占 1 字符（raw 保留可能的 \r）
+  }
+  return heads;
+}
+
+// 有边界的英文 jev / obra 旧段切除（保守）：品牌匹配标题 + 段内至少 2 个高置信特征。
+// 下边界 = 其后第一个层级不深于该标题（同级/更高级）的【任意】ATX 标题（不看标题
+// 文本）；其后再无同级以上标题时才合法切到 EOF。多个竞品段一次扫描、逐段独立判定
+// 边界；任一段证据不足（hits<2）-> unresolvable，调用方 WARN 整文件保留。
 const FOREIGN_SECTION_FEATURES = [
   'TypeSafe Jev', 'Failure Modes', 'jev-using-superpowers',
   'docs/CONFIDENCE.md', 'superpowers:using-superpowers', 'jev-superpowers',
 ];
 function cutForeignMarkedSections(content) {
   if (!FOREIGN_SECTION_FEATURES.some(f => content.includes(f))) return { text: content, cut: false, unresolvable: false };
-  const headRe = /^[ \t]{0,3}(#{1,3})[ \t]+(.+?)[ \t#]*\r?$/gm;
-  const heads = [...content.matchAll(headRe)]
-    .filter(m => /superpowers|typesafe\s*jev/i.test(m[2]))
-    .map(m => ({ index: m.index, level: m[1].length }));
-  if (heads.length === 0) return { text: content, cut: false, unresolvable: true };
-  let text = content;
-  let cut = false;
-  // 从后往前切，下标不失效
-  for (let i = heads.length - 1; i >= 0; i--) {
-    const start = heads[i].index;
-    let end = text.length;
-    for (let j = i + 1; j < heads.length; j++) {
-      if (heads[j].level <= heads[i].level) { end = heads[j].index; break; }
+  const all = scanAtxHeadings(content);
+  const brandRe = /superpowers|typesafe\s*jev/i;
+  const candidates = all.filter(h => brandRe.test(h.text));
+  if (candidates.length === 0) return { text: content, cut: false, unresolvable: true };
+  // 先在【原始文本】上为每个候选段独立计算 [start,end)：只在全部标题序列里找
+  // 边界，用户自写标题（无品牌词）同样能终止切除，绝不一路吞到 EOF。
+  const ranges = candidates.map((h) => {
+    const pos = all.indexOf(h);
+    let end = content.length; // 其后无同级/更高级标题 -> 文件尾是唯一合法边界
+    for (let j = pos + 1; j < all.length; j++) {
+      if (all[j].level <= h.level) { end = all[j].index; break; }
     }
-    const section = text.slice(start, end);
+    return { start: h.index, end };
+  });
+  // 任一段高置信特征不足 -> 边界/归属存疑，保守整文件保留（不做部分切除）。
+  for (const r of ranges) {
+    const section = content.slice(r.start, r.end);
     const hits = FOREIGN_SECTION_FEATURES.filter(f => section.includes(f)).length;
     if (hits < 2) return { text: content, cut: false, unresolvable: true };
-    text = text.slice(0, start) + text.slice(end);
+  }
+  let text = content;
+  let cut = false;
+  // 区间按标题嵌套关系必然互斥或包含；从后往前切下标不失效。
+  for (let i = ranges.length - 1; i >= 0; i--) {
+    text = text.slice(0, ranges[i].start) + text.slice(ranges[i].end);
     cut = true;
   }
   return { text, cut, unresolvable: false };
@@ -1780,6 +1827,143 @@ function printPlanMatrix(plan, opts) {
   }
 }
 
+// --- 共存环境 WARN（规格 §7.7.1）：全局 npm 旧包 + 项目/全局交叉副本，均 best-effort ---
+
+// 定位 PATH 上 npm.cmd 旁的 npm-cli.js（仅 Windows 需要）。
+function findNpmCliJs() {
+  const pathSep = process.platform === 'win32' ? ';' : ':';
+  for (const d of (process.env.PATH || '').split(pathSep).filter(Boolean)) {
+    try {
+      const cli = resolve(d, 'node_modules', 'npm', 'bin', 'npm-cli.js');
+      if (existsSync(cli)) return cli;
+    } catch {}
+  }
+  return null;
+}
+
+// best-effort 取 npm root -g（3s 超时；shell:false；npm 不存在/超时/异常 -> null 静默）。
+// Windows 上 npm 是 npm.cmd，shell:false 直 spawn 会 ENOENT/EINVAL（Node 安全收紧），
+// 改用当前 node 直跑 npm-cli.js（不经 shell，无 argv 注入面）。
+// JEVZH_TEST_NPM_ROOT_G：测试夹具/排障注入接缝（与 JEVZH_FAULT 同性质，生产环境无此变量）。
+function npmGlobalRoot() {
+  const injected = process.env.JEVZH_TEST_NPM_ROOT_G;
+  if (injected !== undefined) return injected.trim() || null;
+  const args = ['root', '-g'];
+  let r = null;
+  try {
+    r = spawnSync('npm', args, { encoding: 'utf8', timeout: 3000, shell: false, windowsHide: true });
+  } catch { r = null; }
+  if ((!r || r.error || r.status !== 0) && process.platform === 'win32') {
+    const cli = findNpmCliJs();
+    if (cli) {
+      try {
+        r = spawnSync(process.execPath, [cli, ...args],
+          { encoding: 'utf8', timeout: 3000, shell: false, windowsHide: true });
+      } catch { r = null; }
+    }
+  }
+  if (!r || r.error || r.status !== 0) return null;
+  const line = String(r.stdout || '').trim().split(/\r?\n/).filter(Boolean).pop();
+  return line || null;
+}
+
+// 文件是否含任一发行版（jevzh / 旧 superpowers-zh）痕迹：两类哨兵或品牌/增量标记。
+function fileHasDistroMark(abs) {
+  let t;
+  try { t = readFileSync(abs, 'utf8'); } catch { return false; }
+  return t.includes(SENTINEL_BEGIN) || t.includes(ZH_SENTINEL_BEGIN)
+    || t.includes(PKG.name) || t.includes(FORK_MARK);
+}
+
+// 技能目录是否含本包 meta 或 zh/jevzh 旧标记技能（限量只读扫描，best-effort 不拖累）。
+function dirHasDistroSkills(skillsAbs, maxCheck = 40) {
+  let ents;
+  try { ents = readdirSync(skillsAbs, { withFileTypes: true }); } catch { return false; }
+  for (const ent of ents.slice(0, maxCheck)) {
+    if (!ent.isDirectory()) continue;
+    const d = resolve(skillsAbs, ent.name);
+    try { if (existsSync(resolve(d, '.jevzh-meta.json'))) return true; } catch {}
+    const skill = resolve(d, 'SKILL.md');
+    if (existsSync(skill)) {
+      try {
+        const t = readFileSync(skill, 'utf8');
+        if (t.includes(FORK_MARK) || t.includes(PKG.name) || /(?<!jev-)superpowers-zh/.test(t)) return true;
+      } catch {}
+    }
+  }
+  return false;
+}
+
+// 在给定作用域（project/global）的典型落位找发行版痕迹，返回命中位置说明（少量、去重）。
+function detectScopeCopy(scope, baseDir) {
+  const hits = [];
+  const add = (s) => { if (!hits.includes(s)) hits.push(s); };
+  const descMap = ROUTER_DESCRIPTORS[scope] || {};
+  for (const [targetName, desc] of Object.entries(descMap)) {
+    for (const rel of desc.shared || []) {
+      const abs = resolve(baseDir, rel);
+      if (fileHasDistroMark(abs)) add(rel);
+    }
+    for (const s of desc.standalone || []) {
+      const abs = resolve(baseDir, s.oursRel);
+      if (fileHasDistroMark(abs)) add(s.oursRel);
+    }
+    const t = TARGETS.find(x => x.name === targetName);
+    if (!t) continue;
+    const skillsRel = scope === 'global' ? globalRelDir(t) : t.dir;
+    if (!skillsRel) continue;
+    const skillsAbs = isAbsolute(skillsRel) ? skillsRel : resolve(baseDir, skillsRel);
+    if (dirHasDistroSkills(skillsAbs)) {
+      add(scope === 'global' ? skillsRel.split(sep).join('/').replace(/^[A-Za-z]:/, '') : skillsRel);
+    }
+  }
+  return hits;
+}
+
+let coexistWarnCache = null;
+// 返回本次安装的纯咨询 WARN 文案列表（不阻断、不改退出码）；结果按运行参数缓存。
+function detectCoexistWarnings(isGlobal, projectDir) {
+  const key = `${isGlobal ? 'global' : 'project'}:${resolve(projectDir)}`;
+  if (coexistWarnCache && coexistWarnCache.key === key) return coexistWarnCache.out;
+  const out = [];
+  try {
+    const root = npmGlobalRoot();
+    if (root) {
+      const pkgJson = resolve(root, 'node_modules', 'superpowers-zh', 'package.json');
+      if (existsSync(pkgJson)) {
+        out.push(`检测到全局 npm 旧包 superpowers-zh（${pkgJson}）：它与 jevzh 的 CLI 名不同`
+          + '（superpowers-zh vs jevzh），可以共存，但建议先卸载旧全局包避免误用：'
+          + 'npm uninstall -g superpowers-zh（本条仅提示，不阻断安装）。');
+      }
+    }
+  } catch {}
+  try {
+    if (isGlobal) {
+      const hits = detectScopeCopy('project', projectDir);
+      if (hits.length) {
+        out.push(`当前项目已存在项目级 superpowers-zh/jevzh 副本（${hits.slice(0, 4).join('、')}）：`
+          + '本次全局安装后，在该项目内开会话时【项目级副本优先级高于全局副本】，可能双重生效/路由并存；'
+          + '若只想保留全局一套，可在该项目目录执行 npx jevzh --uninstall 清理项目级副本。');
+      }
+    } else if (resolve(projectDir) !== resolve(homedir())) {
+      const hits = detectScopeCopy('global', homedir());
+      if (hits.length) {
+        out.push(`检测到用户主目录已有全局 superpowers-zh/jevzh 副本（${hits.slice(0, 4).join('、')}）：`
+          + '本次项目级安装后，在当前项目内【项目级副本优先于全局副本】，其他项目仍走全局副本，'
+          + '两套可能路由并存；如不希望混用，可在主目录执行 npx jevzh --global --uninstall 移除全局副本。');
+      }
+    }
+  } catch {}
+  coexistWarnCache = { key, out };
+  return out;
+}
+
+function printCoexistWarnings(isGlobal, projectDir) {
+  const warns = detectCoexistWarnings(isGlobal, projectDir);
+  for (const w of warns) console.warn(`  ⚠️ [WARN] 共存提示：${w}`);
+  return warns.length;
+}
+
 // --- 备份轮次：.jevzh/backups/<ts>/，整文件/整目录首拍快照 + manifest ---
 function makeBackupTs(when = new Date()) {
   const p2 = n => String(n).padStart(2, '0');
@@ -1796,26 +1980,56 @@ function backupsRootFor(baseDir) {
   return resolve(baseDir, '.jevzh', 'backups');
 }
 
+// 文件载荷完整性指纹：size（字节）+ sha256（hex）。restore 预演/写后两次核对。
+function fileIntegrity(abs) {
+  const buf = readFileSync(abs);
+  return { size: buf.length, sha256: createHash('sha256').update(buf).digest('hex') };
+}
+
+// 目录载荷清单：载荷目录内全部文件相对路径（正斜杠、字典序）。
+// 目录不强制整体哈希，restore 时按此清单逐项核对存在性。
+function listPayloadFiles(payloadAbs) {
+  const out = [];
+  const walk = (d, rel) => {
+    for (const ent of readdirSync(d, { withFileTypes: true })) {
+      const r = rel ? `${rel}/${ent.name}` : ent.name;
+      const p = resolve(d, ent.name);
+      if (ent.isDirectory()) walk(p, r);
+      else if (ent.isFile()) out.push(r);
+    }
+  };
+  walk(payloadAbs, '');
+  return out.sort();
+}
+
 function createBackupRun(baseDir, isGlobal, kind = 'install', extra = {}) {
   const ts = makeBackupTs();
   const root = resolve(backupsRootFor(baseDir), ts);
   let seq = 0;
   let fsReady = false;
-  const payloadByRel = new Map(); // rel -> {kind, payload, existed}
+  const payloadByRel = new Map(); // rel -> {kind, payload, existed, size?, sha256?, files?}
   const targetEntries = new Map();
 
   const ensureFs = () => {
     if (!fsReady) { mkdirSync(root, { recursive: true }); fsReady = true; }
   };
-  const register = (targetName, rel, kindEntry, existed, payload) => {
+  const register = (targetName, rel, kindEntry, existed, info) => {
     if (!targetEntries.has(targetName)) targetEntries.set(targetName, []);
     const list = targetEntries.get(targetName);
+    const integrity = info.payload
+      ? {
+          payload: info.payload,
+          ...(typeof info.size === 'number' ? { size: info.size } : {}),
+          ...(info.sha256 ? { sha256: info.sha256 } : {}),
+          ...(Array.isArray(info.files) ? { files: info.files } : {}),
+        }
+      : { payload: info.payload };
     if (!list.some(e => e.relPath === rel)) {
-      list.push({ relPath: rel.split(sep).join('/'), kind: kindEntry, existed, payload });
+      list.push({ relPath: rel.split(sep).join('/'), kind: kindEntry, existed, ...integrity });
     } else {
       const old = list.find(e => e.relPath === rel);
-      // 同一 target 内先记 new 后记 existed：以更保守的 existed 为准
-      if (existed) { old.existed = true; old.payload = payload; }
+      // 同一 target 内先记 new 后记 existed：以更保守的 existed 为准，并同步指纹。
+      if (existed) { old.existed = true; Object.assign(old, integrity); }
     }
   };
 
@@ -1833,16 +2047,18 @@ function createBackupRun(baseDir, isGlobal, kind = 'install', extra = {}) {
         const dst = resolve(root, payload);
         mkdirSync(dirname(dst), { recursive: true });
         copyFileSync(abs, dst);
-        payloadByRel.set(rel, { kind: 'file', payload, existed });
+        // 对落盘后的载荷算指纹（而非源文件）：备份自损（截断/拷贝异常）也能在
+        // restore 预演时暴露。
+        payloadByRel.set(rel, { kind: 'file', payload, existed, ...fileIntegrity(dst) });
       }
       const info = payloadByRel.get(rel);
-      register(targetName, rel, 'file', existed, info.payload);
+      register(targetName, rel, 'file', existed, info);
       return { ...info, firstCapture: true };
     },
     noteFile(targetName, rel, existed, kindEntry = 'file') {
       if (!payloadByRel.has(rel)) payloadByRel.set(rel, { kind: kindEntry, payload: null, existed });
       const info = payloadByRel.get(rel);
-      register(targetName, rel, kindEntry, existed, info.payload);
+      register(targetName, rel, kindEntry, existed, info);
     },
     captureDir(targetName, abs, rel) {
       if (!payloadByRel.has(rel)) {
@@ -1852,10 +2068,10 @@ function createBackupRun(baseDir, isGlobal, kind = 'install', extra = {}) {
         const dst = resolve(root, payload);
         mkdirSync(dst, { recursive: true });
         copyDirSync(abs, dst);
-        payloadByRel.set(rel, { kind: 'dir', payload, existed: true });
+        payloadByRel.set(rel, { kind: 'dir', payload, existed: true, files: listPayloadFiles(dst) });
       }
       const info = payloadByRel.get(rel);
-      register(targetName, rel, 'dir', true, info.payload);
+      register(targetName, rel, 'dir', true, info);
       return info;
     },
     payloadFor(rel) { return payloadByRel.get(rel) || null; },
@@ -2469,6 +2685,23 @@ async function doctor(forceToolName, opts) {
     }
   }
 
+  // 项目配置 .jevzh.json 健康度（R-1：computeReadinessFallback 对坏 JSON 静默按默认
+  // 取值，doctor 必须把该问题显式报告出来：门禁将按默认配置运行，exit 走 WARN 级）。
+  if (!isGlobal) {
+    const cfgPath = resolve(baseDir, '.jevzh.json');
+    if (existsSync(cfgPath)) {
+      try {
+        const c = JSON.parse(readFileSync(cfgPath, 'utf8'));
+        if (!c || typeof c !== 'object' || Array.isArray(c)) throw new Error('顶层不是 JSON 对象');
+      } catch (e) {
+        hasWarn = true;
+        console.log(`  [问题] 配置文件损坏：${cfgPath} 不是合法 JSON（${e.message}）。`);
+        console.log('          门禁将按默认配置运行（backend=auto、软降级开启，不会读取其中的 strict/baseUrl）；'
+          + `修复 JSON 语法或删除该文件后重跑 npx jevzh 可重新生成。`);
+      }
+    }
+  }
+
   // 就绪四态（spawn bash 仓内 scripts/jev-readiness --json；bash 缺失优雅降级 Node 版）
   if (!opts.noJev) {
     const r = await probeReadiness(baseDir, isGlobal, !!opts.strict);
@@ -2545,6 +2778,97 @@ function printBackupList(baseDir) {
   console.log(`\n  恢复命令：npx jevzh restore <时间戳>`);
 }
 
+// restore 预演校验：只读取备份目录，绝不触碰活文件（在 pre-restore 自动备份与任何
+// 删除之前调用）。
+//   - 新备份（file 条目带 sha256）：载荷存在 + 类型正确 + size + sha256 全核对；
+//   - legacy 备份（条目无 sha256，旧版升级后留存）：legacyWeak=true，能核对 size
+//     就核对，.json 目标额外 JSON.parse 校验——绝不因兼容旧备份而跳过所有校验；
+//   - dir 条目：载荷目录存在，manifest 声明的 files 清单逐个存在。
+// 返回 { legacyWeak, failures }；failures[0] 即首个不符项（中文报告用）。
+function verifyBackupPayloads(src, entries) {
+  const failures = [];
+  let legacyWeak = false;
+  for (const e of entries) {
+    if (e.existed !== true) continue;
+    const relPath = e.relPath;
+    if (!e.payload) {
+      failures.push({ relPath, reason: '备份缺少载荷路径（manifest 声明 existed 却无 payload）' });
+      continue;
+    }
+    const payloadAbs = resolve(src, e.payload);
+    let st;
+    try { st = lstatSync(payloadAbs); } catch { st = null; }
+    if (!st) { failures.push({ relPath, reason: `载荷不存在：${e.payload}` }); continue; }
+    if (e.kind === 'dir') {
+      if (!st.isDirectory()) { failures.push({ relPath, reason: `载荷类型不符：${e.payload} 不是目录` }); continue; }
+      if (Array.isArray(e.files)) {
+        const missing = e.files.find(f => !existsSync(resolve(payloadAbs, f)));
+        if (missing) failures.push({ relPath, reason: `目录载荷不完整，缺少：${e.payload}/${missing}` });
+      }
+      continue;
+    }
+    if (!st.isFile()) { failures.push({ relPath, reason: `载荷类型不符：${e.payload} 不是文件` }); continue; }
+    if (e.sha256) {
+      const got = fileIntegrity(payloadAbs);
+      if (typeof e.size === 'number' && got.size !== e.size) {
+        failures.push({ relPath, reason: `载荷大小不匹配：期望 ${e.size} 字节，实际 ${got.size} 字节` });
+        continue;
+      }
+      if (got.sha256 !== e.sha256) {
+        failures.push({
+          relPath,
+          reason: `载荷 sha256 不匹配：期望 ${e.sha256.slice(0, 16)}…，实际 ${got.sha256.slice(0, 16)}…`,
+        });
+      }
+    } else {
+      legacyWeak = true; // 旧备份：无完整性哈希，仅做弱校验
+      if (typeof e.size === 'number' && st.size !== e.size) {
+        failures.push({ relPath, reason: `载荷大小不匹配（弱校验）：期望 ${e.size} 字节，实际 ${st.size} 字节` });
+        continue;
+      }
+      if (/\.json$/i.test(relPath)) {
+        try { JSON.parse(readFileSync(payloadAbs, 'utf8')); }
+        catch (err) { failures.push({ relPath, reason: `JSON 目标无法解析（弱校验）：${err.message}` }); }
+      }
+    }
+  }
+  return { legacyWeak, failures };
+}
+
+// restore 写后复核：每个 existed 条目按其声明的完整性重新核对活文件；
+// 新备份比 sha256（+size），legacy 仅比 size，目录比文件清单齐全。
+function verifyRestoredEntries(absFor, entries) {
+  const failures = [];
+  for (const e of entries) {
+    if (e.existed !== true) continue;
+    const abs = absFor(e);
+    let st;
+    try { st = lstatSync(abs); } catch { st = null; }
+    if (!st) { failures.push({ rel: e.relPath, reason: '恢复后目标不存在' }); continue; }
+    if (e.kind === 'dir') {
+      if (!st.isDirectory()) { failures.push({ rel: e.relPath, reason: '恢复后目标不是目录' }); continue; }
+      if (Array.isArray(e.files)) {
+        const missing = e.files.find(f => !existsSync(resolve(abs, f)));
+        if (missing) failures.push({ rel: e.relPath, reason: `恢复后目录不完整，缺少：${missing}` });
+      }
+      continue;
+    }
+    if (!st.isFile()) { failures.push({ rel: e.relPath, reason: '恢复后目标不是文件' }); continue; }
+    const got = fileIntegrity(abs);
+    if (e.sha256) {
+      if (got.sha256 !== e.sha256) {
+        failures.push({
+          rel: e.relPath,
+          reason: `写后 sha256 不一致：期望 ${e.sha256.slice(0, 16)}…，实际 ${got.sha256.slice(0, 16)}…`,
+        });
+      }
+    } else if (typeof e.size === 'number' && got.size !== e.size) {
+      failures.push({ rel: e.relPath, reason: `写后大小不一致（弱校验）：期望 ${e.size} 字节，实际 ${got.size} 字节` });
+    }
+  }
+  return failures;
+}
+
 function restore(tsArg, opts) {
   const isGlobal = !!opts.isGlobal;
   const baseDir = isGlobal ? homedir() : PROJECT_DIR;
@@ -2578,14 +2902,29 @@ function restore(tsArg, opts) {
     return 1;
   }
 
-  // 恢复前再备一份当前状态（pre-restore 安全网，轮转保留最近 3 份）。
-  const safety = createBackupRun(baseDir, isGlobal, 'pre-restore', { restoreOf: tsArg });
   const entries = [];
   for (const g of targetGroups) {
     for (const e of g.entries) {
       if (!entries.some(x => x.relPath === e.relPath)) entries.push({ ...e, target: g.target });
     }
   }
+
+  // ── 预演校验（任何删除/自动备份之前；只读备份目录，活文件零触碰）──
+  const verify = verifyBackupPayloads(src, entries);
+  if (verify.legacyWeak) {
+    console.warn('  ⚠️ WARN 旧备份无完整性哈希（sha256），仅做弱校验（size 核对 + JSON 目标可解析）；'
+      + '弱校验无法识别同尺寸篡改。');
+  }
+  if (verify.failures.length > 0) {
+    const f = verify.failures[0];
+    console.error(`  ❌ 备份完整性校验失败：${f.relPath} ${f.reason}`);
+    console.error('     恢复已整体中止：未删除/覆盖任何活文件（也未创建 pre-restore 备份）。'
+      + '请修复备份后重试，或改用其他时间戳：npx jevzh restore --list');
+    return 1;
+  }
+
+  // 恢复前再备一份当前状态（pre-restore 安全网，轮转保留最近 3 份）。
+  const safety = createBackupRun(baseDir, isGlobal, 'pre-restore', { restoreOf: tsArg });
   for (const e of entries) {
     if (e.existed) {
       const abs = restoreEntryAbs(baseDir, e.target, e.relPath);
@@ -2596,23 +2935,25 @@ function restore(tsArg, opts) {
       }
     }
   }
-  safety.finalize();
+  const safetyTs = safety.finalize();
+
+  const absFor = (e) => restoreEntryAbs(baseDir, e.target, e.relPath);
+  const entryRootFor = (abs, e) => {
+    const homeRoot = resolve(baseDir);
+    if (isInsideDir(homeRoot, abs)) return homeRoot;
+    const t = TARGETS.find(x => x.name === e.target);
+    if (t && t.global && process.platform === 'win32' && t.global.dirWin) {
+      const gAbs = globalRelDir(t);
+      if (gAbs && isAbsolute(gAbs)) return resolve(gAbs, '..');
+    }
+    return homeRoot;
+  };
 
   console.log(`\n  恢复 ${tsArg}（${entries.length} 项；恢复前已再备一份当前状态）→ ${baseDir}\n`);
   let restored = 0;
   for (const e of entries) {
-    const abs = restoreEntryAbs(baseDir, e.target, e.relPath);
-    // 越界判定同样按条目根：重定向 dirWin 条目允许落在其文件根内。
-    const entryRoot = (() => {
-      const homeRoot = resolve(baseDir);
-      if (isInsideDir(homeRoot, abs)) return homeRoot;
-      const t = TARGETS.find(x => x.name === e.target);
-      if (t && t.global && process.platform === 'win32' && t.global.dirWin) {
-        const gAbs = globalRelDir(t);
-        if (gAbs && isAbsolute(gAbs)) return resolve(gAbs, '..');
-      }
-      return homeRoot;
-    })();
+    const abs = absFor(e);
+    const entryRoot = entryRootFor(abs, e);
     if (!isInsideDir(entryRoot, abs)) {
       console.warn(`  ⚠️ 跳过越界路径：${e.relPath}`);
       continue;
@@ -2624,19 +2965,18 @@ function restore(tsArg, opts) {
       continue;
     }
     if (e.existed === true) {
-      if (!e.payload) { console.warn(`  ⚠️ 备份缺少载荷：${e.relPath}`); continue; }
       const payloadAbs = resolve(src, e.payload);
-      if (!existsSync(payloadAbs)) { console.warn(`  ⚠️ 载荷不存在：${e.payload}`); continue; }
-      if (st) {
-        if (st.isDirectory()) rmSync(abs, { recursive: true, force: true });
-        else rmSync(abs, { force: true });
-      }
-      mkdirSync(dirname(abs), { recursive: true });
       if (e.kind === 'dir') {
+        if (st) rmSync(abs, { recursive: true, force: true });
         mkdirSync(abs, { recursive: true });
         copyDirSync(payloadAbs, abs);
       } else {
-        copyFileSync(payloadAbs, abs);
+        // 先在内存读入已通过预演校验的载荷，原子 rename 覆盖活文件，
+        // 避免「先删后拷」窗口被中断留下半截文件。
+        const buf = readFileSync(payloadAbs);
+        mkdirSync(dirname(abs), { recursive: true });
+        if (st && st.isDirectory()) rmSync(abs, { recursive: true, force: true });
+        atomicWriteFileSync(abs, buf);
       }
       console.log(`  ✅ 还原 ${e.relPath}`);
       restored++;
@@ -2652,17 +2992,8 @@ function restore(tsArg, opts) {
   }
   // 修剪清空目录（重定向 dirWin 条目按其文件根向上修剪，不越过该根）
   for (const e of entries) {
-    const abs = restoreEntryAbs(baseDir, e.target, e.relPath);
-    const root = isInsideDir(baseDir, abs)
-      ? resolve(baseDir)
-      : (() => {
-          const t = TARGETS.find(x => x.name === e.target);
-          if (t && t.global && process.platform === 'win32' && t.global.dirWin) {
-            const gAbs = globalRelDir(t);
-            if (gAbs && isAbsolute(gAbs)) return resolve(gAbs, '..');
-          }
-          return resolve(baseDir);
-        })();
+    const abs = absFor(e);
+    const root = entryRootFor(abs, e);
     let d = dirname(abs);
     for (let i = 0; i < 8; i++) {
       if (resolve(d) === root || !isInsideDir(root, d)) break;
@@ -2675,7 +3006,19 @@ function restore(tsArg, opts) {
       d = dirname(d);
     }
   }
-  console.log(`\n  恢复完成：${restored} 项。当前状态备份可在不满意时再次 restore。\n`);
+
+  // ── 写后复核：活文件必须与备份声明一致；不符 rc=1 并指向 pre-restore 回退 ──
+  const postFailures = verifyRestoredEntries(absFor, entries);
+  if (postFailures.length > 0) {
+    const f = postFailures[0];
+    console.error(`\n  ❌ 恢复后完整性复核失败：${f.relPath} ${f.reason}`);
+    if (safetyTs) {
+      console.error('     恢复前的当前状态已自动备份，可立即回退：'
+        + `npx jevzh restore ${safetyTs}\n`);
+    }
+    return 1;
+  }
+  console.log(`\n  恢复完成：${restored} 项（写后完整性复核通过）。当前状态备份可在不满意时再次 restore。\n`);
   return 0;
 }
 
@@ -2707,33 +3050,152 @@ function redactUrl(urlString) {
 }
 
 function readinessScriptPath() {
-  return resolve(__dirname, '..', 'scripts', 'jev-readiness');
+  // JEVZH_TEST_READINESS_SCRIPT：仅供测试把权威脚本替换为可注入的 stub（生产
+  // 环境未设置时恒为仓内 scripts/jev-readiness）。
+  return process.env.JEVZH_TEST_READINESS_SCRIPT
+    ? resolve(process.env.JEVZH_TEST_READINESS_SCRIPT)
+    : resolve(__dirname, '..', 'scripts', 'jev-readiness');
 }
 
-// 优先 spawn bash 仓内权威脚本；不可用/超时/输出非法时返回 Node 轻量探测结果。
+// Git for Windows 固定安装路径（与 hooks/run-hook.cmd 的查找顺序一致）：
+// 企业环境 PATH 上常常只有 WSL 的 bash.exe 存根（未装发行版时退出 127），
+// 直接 spawn 'bash' 会误判「不可用」。
+const GIT_BASH_FIXED_PATHS = [
+  'C:\\Program Files\\Git\\bin\\bash.exe',
+  'C:\\Program Files (x86)\\Git\\bin\\bash.exe',
+];
+// 权威脚本实测冷启动 5.7~6.0s（node 多次自举）；旧 4s 超时会把成功运行误降级。
+const READINESS_TIMEOUT_MS = Number(process.env.JEVZH_TEST_READINESS_TIMEOUT_MS) || 15000;
+// 探活单次 5s（Git Bash 冷启动实测 0.2~0.5s；留足高负载余量），失败再重试 1 次：
+// 机器被并发任务打满时单次 spawn 可能超过 3s，重试可避免偶发误降级。
+const BASH_PROBE_TIMEOUT_MS = 5000;
+const BASH_PROBE_ATTEMPTS = 2;
+const BASH_PROBE_MARKER = 'jevzh-bash-ok';
+
+// bash 候选（按优先级）：
+//   Windows：Git for Windows 两个固定路径 -> PATH 上的 bash；
+//   POSIX：PATH 上的 bash。
+// JEVZH_TEST_BASH：测试/排障注入，强制只使用给定可执行文件。
+function bashCandidates() {
+  const forced = process.env.JEVZH_TEST_BASH;
+  // '__none__' 测试约定：强制「无任何候选 bash」，用于覆盖 not-found 分支。
+  if (forced === '__none__') return [];
+  if (forced) return [forced];
+  const list = [];
+  if (process.platform === 'win32') {
+    for (const p of GIT_BASH_FIXED_PATHS) {
+      try { if (existsSync(p)) list.push(p); } catch {}
+    }
+  }
+  if (process.platform !== 'win32' || isOnPath('bash')) list.push('bash');
+  return list;
+}
+
+// JEVZH_TEST_BASH_ARGV：测试专用接缝——把「解释器 + 包装脚本」整体伪装成 bash
+// （Windows 下 spawn 不能 shell:false 直跑 .cmd，而 node 需要脚本前缀才能应答 -c）。
+// 值为 JSON argv 数组，如 ["<node.exe>","<fake-bash.mjs>"]；生产环境不设置即零行为。
+// 返回 { exe, prefix } 或 null（未配置/配置非法）。
+function forcedBashSpawn() {
+  const raw = process.env.JEVZH_TEST_BASH_ARGV;
+  if (!raw) return null;
+  try {
+    const a = JSON.parse(raw);
+    if (Array.isArray(a) && a.length >= 2 && a.every(x => typeof x === 'string' && x.length > 0)) {
+      return { exe: a[0], prefix: a.slice(1) };
+    }
+  } catch {}
+  return null;
+}
+
+// 探活：-c 输出固定标记且退出码 0。PATH 上的 WSL 存根（无发行版 -> 127）、
+// 任何非 bash 可执行文件都过不了这一关。prefix 为测试包装脚本前缀（生产恒为空）。
+function probeBashLiveness(exe, prefix = []) {
+  for (let attempt = 1; attempt <= BASH_PROBE_ATTEMPTS; attempt++) {
+    let r;
+    try {
+      r = spawnSync(exe, [...prefix, '-c', `echo ${BASH_PROBE_MARKER}`], {
+        encoding: 'utf8',
+        timeout: BASH_PROBE_TIMEOUT_MS,
+        windowsHide: true,
+      });
+    } catch {
+      continue;
+    }
+    if (r && !r.error && r.status === 0 && String(r.stdout || '').includes(BASH_PROBE_MARKER)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+// 返回首个探活通过的 bash；全失败时给出三态之一原因：
+//   not-found     固定路径与 PATH 都没有 bash
+//   probe-failed  候选存在但探活非 0/超时（WSL 存根等）
+function resolveUsableBash() {
+  const forcedSpawn = forcedBashSpawn();
+  if (forcedSpawn) {
+    const { exe, prefix } = forcedSpawn;
+    if (isAbsolute(exe)) {
+      try { if (!existsSync(exe)) return { ok: false, reason: 'probe-failed', candidates: [exe] }; }
+      catch { return { ok: false, reason: 'probe-failed', candidates: [exe] }; }
+    }
+    if (probeBashLiveness(exe, prefix)) return { ok: true, exe, prefixArgs: prefix, candidates: [exe] };
+    return { ok: false, reason: 'probe-failed', candidates: [exe] };
+  }
+  const candidates = bashCandidates();
+  if (!candidates.length) return { ok: false, reason: 'not-found', candidates };
+  for (const exe of candidates) {
+    // 绝对路径候选必须真实存在；'bash'（PATH 查找）交给 spawn。
+    if (exe !== 'bash' && isAbsolute(exe)) {
+      try { if (!existsSync(exe)) continue; } catch { continue; }
+    }
+    if (probeBashLiveness(exe)) return { ok: true, exe, prefixArgs: [], candidates };
+  }
+  return { ok: false, reason: 'probe-failed', candidates };
+}
+
+// 优先 spawn bash 仓内权威脚本；区分三态降级文案：未找到 bash / bash 探活失败 /
+// 脚本执行超时；输出非法时也回退 Node 轻量探测。
+// 本次执行实际使用的就绪脚本超时（env 每次读取，便于测试注入）。
+function readinessTimeoutMs() {
+  return Number(process.env.JEVZH_TEST_READINESS_TIMEOUT_MS) || READINESS_TIMEOUT_MS;
+}
+
 async function probeReadiness(baseDir, isGlobal, strict) {
-  const started = Date.now();
   const fallback = await computeReadinessFallback(baseDir, isGlobal, strict);
+  const timeoutMs = readinessTimeoutMs();
+  const found = resolveUsableBash();
+  if (!found.ok) {
+    const detail = found.reason === 'not-found'
+      ? '未找到 bash（Git for Windows 固定路径与 PATH 均无 bash，跳过权威脚本）'
+      : 'bash 探活失败（PATH 上可能是 WSL 存根/退出码非 0/探活超时，跳过权威脚本）';
+    return { source: `Node 轻量探测（${detail}）`, data: fallback };
+  }
   let bash;
   try {
-    bash = spawnSync('bash', [readinessScriptPath(), '--project', baseDir, '--json'], {
+    bash = spawnSync(found.exe,
+      [...(found.prefixArgs || []), readinessScriptPath(), '--project', baseDir, '--json'], {
       encoding: 'utf8',
-      timeout: 4000,
+      timeout: timeoutMs,
       windowsHide: true,
     });
   } catch {
-    return { source: 'Node 轻量探测（bash 不可用）', data: fallback };
+    return { source: 'Node 轻量探测（bash 就绪脚本启动异常）', data: fallback };
+  }
+  if (bash && bash.error && bash.error.code === 'ETIMEDOUT') {
+    return {
+      source: `Node 轻量探测（bash 就绪脚本执行超时（>${Math.round(timeoutMs / 1000)}s），改用 Node 同口径探测）`,
+      data: fallback,
+    };
   }
   if (!bash || bash.error || bash.status !== 0 || !bash.stdout) {
-    return { source: 'Node 轻量探测（bash 就绪脚本不可用）', data: fallback };
+    return { source: 'Node 轻量探测（bash 就绪脚本执行失败）', data: fallback };
   }
   const lines = bash.stdout.split(/\r?\n/).filter(Boolean);
   for (let i = lines.length - 1; i >= 0; i--) {
     try {
       const j = JSON.parse(lines[i]);
       if (j && typeof j === 'object' && ['FULL', 'LOCAL', 'PARTIAL', 'DEGRADED'].includes(j.state)) {
-        // 整体超时兜底（脚本理论 4s 上限；防御）
-        if (Date.now() - started > 6000) return { source: 'Node 轻量探测（bash 超时）', data: fallback };
         return {
           source: 'scripts/jev-readiness（bash 权威口径）',
           data: {
@@ -3660,6 +4122,11 @@ ${target.noProjectReason || `        其官方文档只给出用户级技能目�
     return 1;
   }
 
+  // ── 共存环境 WARN（规格 §7.7.1；best-effort 只读、纯咨询不阻断）──
+  // 项目侧恒按实际 cwd（PROJECT_DIR）扫描：全局安装时 baseDir 是 homedir()，
+  // 但「当前目录已有项目副本」的交叉风险必须看运行目录。
+  printCoexistWarnings(isGlobal, PROJECT_DIR);
+
   // ── 预检（纯只读）：五级处置矩阵 + 插件/坏 JSON/链接容器硬阻断 ──
   const plans = chosen.map(target => preflightTarget(target, baseDir, isGlobal, effOpts));
   for (const plan of plans) printPlanMatrix(plan, effOpts);
@@ -3865,4 +4332,14 @@ export {
   classifySkillSource,
   classifyHealth,
   redactUrl,
+  // 任务 7 审查修复的测试接缝（纯函数/只读探测，无副作用）
+  scanAtxHeadings,
+  cutForeignMarkedSections,
+  verifyBackupPayloads,
+  verifyRestoredEntries,
+  probeReadiness,
+  bashCandidates,
+  resolveUsableBash,
+  READINESS_TIMEOUT_MS,
+  detectCoexistWarnings,
 };
