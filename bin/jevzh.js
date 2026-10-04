@@ -836,6 +836,8 @@ function isSymlinkPath(p) {
 
 // 只安装我们自己拥有、且目标处缺失或与源字节一致的文件；目标处存在但内容
 // 不同的文件视为用户/他方内容，WARN 且不动。
+// 返回 { installed, linkSkipped }：linkSkipped=true 表示容器本身是链接被整目录
+// 跳过（调用方不得再当成功打印 ✅）。
 function installOwnedFiles(srcDir, destDir, fileNames, label) {
   mkdirSync(destDir, { recursive: true });
   // 容器本身是链接（含 Windows junction）：写入会落到链接目标（可能在项目/家目录
@@ -843,7 +845,7 @@ function installOwnedFiles(srcDir, destDir, fileNames, label) {
   if (isSymlinkPath(destDir)) {
     console.warn(`  ⚠️ WARN ${label}: 目标目录 ${destDir} 是符号链接/junction，为防目标侧穿越，`
       + '本次不向其写入任何文件（链接目标未触及）。');
-    return 0;
+    return { installed: 0, linkSkipped: true };
   }
   let installed = 0;
   for (const name of fileNames) {
@@ -867,16 +869,26 @@ function installOwnedFiles(srcDir, destDir, fileNames, label) {
     copyFileWithMode(src, dst, stat);
     installed++;
   }
-  return installed;
+  return { installed, linkSkipped: false };
 }
 
 function installHooksForTarget(target, baseDir) {
   if (!target.hooks) return;
   const hookDest = resolve(baseDir, target.hooks);
   const scriptDest = resolve(baseDir, dirname(target.hooks), 'scripts');
-  const n1 = installOwnedFiles(HOOKS_SRC, hookDest, HOOK_FILES, `${target.name} hooks`);
-  const n2 = installOwnedFiles(SCRIPTS_SRC, scriptDest, GATE_SCRIPT_FILES, `${target.name} scripts`);
-  if (n1 > 0 || existsSync(hookDest)) {
+  const hooks = installOwnedFiles(HOOKS_SRC, hookDest, HOOK_FILES, `${target.name} hooks`);
+  const scripts = installOwnedFiles(SCRIPTS_SRC, scriptDest, GATE_SCRIPT_FILES, `${target.name} scripts`);
+  // R3：hooks 容器本身是链接、已被整目录跳过时，绝不能再凭 existsSync(hookDest)
+  // 为真打 ✅ 成功行（链接路径本来就 exists）——那会与上面的 WARN 自相矛盾。
+  if (hooks.linkSkipped) {
+    console.warn(`  ⚠️ SKIP ${target.name}: 跳过 hooks 运行时（目标目录是符号链接/junction）-> ${hookDest}`
+      + '（未写入任何 hooks 文件，链接目标未触及）。');
+    if (scripts.installed > 0) {
+      console.log(`  ✅ ${target.name}: 门禁脚本 -> ${scriptDest}（与 hooks 容器相互独立，已正常落位）`);
+    }
+    return;
+  }
+  if (hooks.installed > 0 || existsSync(hookDest)) {
     console.log(`  ✅ ${target.name}: hooks 运行时 -> ${hookDest}`);
     console.log(`     门禁脚本 -> ${scriptDest}（session-start/pre-commit/stop 经 run-hook.cmd 调用）`);
     console.log('     ℹ️  settings 自动接线（读改写合并）将在后续版本完成；当前先落运行时文件。');
@@ -884,7 +896,6 @@ function installHooksForTarget(target, baseDir) {
       console.log('     ℹ️  Windows 不跟踪可执行位：钩子统一由 run-hook.cmd 调 Git for Windows bash，无需 chmod +x。');
     }
   }
-  void n2;
 }
 
 // ---------------------------------------------------------------------------
@@ -935,6 +946,16 @@ function isOurManaged(skillDir) {
   }
 }
 
+// 目录完全为空（readdir 长度 0）才算空；任何文件/子目录（含 .gitkeep、
+// .DS_Store）都视为非空。lstat/读失败按非空处理（保守，不擅自接管）。
+function isDirEmpty(dir) {
+  try {
+    return lstatSync(dir).isDirectory() && readdirSync(dir).length === 0;
+  } catch {
+    return false;
+  }
+}
+
 function writeSkillMeta(destSkillDir, target, isGlobal) {
   const meta = {
     pkg: PKG.name,
@@ -950,6 +971,27 @@ function installSkillsForTarget(target, baseDir, isGlobal, opts) {
   const relDir = isGlobal ? globalRelDir(target) : target.dir;
   const dest = resolve(baseDir, relDir);
   const names = selectedSkillNames(opts.noJev);
+
+  // R1：容器本身不存在、但其直接父目录本身是符号链接/junction（如企业环境把
+  // .claude 整体重定向到共享盘/其他分区，容器 .claude/skills 尚不存在）：
+  // mkdir -p 会在链接目标侧创建容器，安装随之写穿到表面路径之外。不阻断
+  // （父级重定向是企业常见部署），仅在写盘前明确披露实际落点，请用户确认来源可信。
+  // 注意：容器本身是链接仍由下方 I-1 硬处理（失败/跳过），本项只针对父级。
+  let destStat;
+  try { destStat = lstatSync(dest); } catch { destStat = null; }
+  if (!destStat) {
+    const parent = dirname(dest);
+    let parentStat;
+    try { parentStat = lstatSync(parent); } catch { parentStat = null; }
+    if (parentStat && parentStat.isSymbolicLink()) {
+      let realParent = parent;
+      try { realParent = realpathSync(parent); } catch {}
+      console.warn(`  ⚠️ WARN ${target.name}: 技能容器 ${dest} 尚不存在，但其直接父目录 ${parent} 是符号链接/junction，`
+        + `新建的 skills/hooks 等文件将实际写入链接目标 ${realParent}（而非表面路径）。`
+        + '请确认该链接来源可信（企业环境把 .claude 等目录重定向到共享盘属常见场景）；本次不阻断安装。');
+    }
+  }
+
   mkdirSync(dest, { recursive: true });
 
   // I-1：技能容器本身是符号链接/junction（Windows npx 缓存、用户手工 junction 都可能
@@ -979,6 +1021,15 @@ function installSkillsForTarget(target, baseDir, isGlobal, opts) {
       }
       if (isOurManaged(dst)) {
         already++;
+      } else if (isDirEmpty(dst)) {
+        // R2：目录存在但完全为空（无 SKILL.md、无 meta）——典型是上次安装中途
+        // 失败（权限/杀软/磁盘）留下的空壳。旧逻辑把它永久判为「非本包管理」，
+        // 之后再也不会补缺；空目录里没有任何用户内容可损失，安全接管：正常复制
+        // 技能内容并写 meta。非空但无 meta 的用户目录仍走下方 WARN，维持不动。
+        console.log(`  ℹ️  接管空目录 ${dst}（目录存在但完全为空，疑似上次安装失败的残留）：补齐技能内容并写入本包 meta。`);
+        copyDirSync(src, dst);
+        writeSkillMeta(dst, target, isGlobal);
+        added++;
       } else {
         console.warn(`  ⚠️ WARN 同名技能 ${name} 已存在于 ${dst} 且非本包管理（无本包 .jevzh-meta.json），`
           + '判定为用户/他方内容，保留不动（零覆盖；任务 7 将提供 --adopt-skills 接管）。');
@@ -1508,10 +1559,19 @@ function uninstall(isGlobal, force = false) {
   if (existsSync(agentsDest)) {
     let agentsRemoved = 0;
     for (const entry of readdirSync(agentsDest)) {
-      if (LEGACY_AGENT_FILENAMES.includes(entry)) {
-        rmSync(resolve(agentsDest, entry), { recursive: true, force: true });
-        agentsRemoved++;
+      if (!LEGACY_AGENT_FILENAMES.includes(entry)) continue;
+      const legacyPath = resolve(agentsDest, entry);
+      // R7：逐项 lstat 护栏 —— 仅删普通文件/链接本身；同名条目意外是目录
+      // （如用户手工建的 code-reviewer.md/ 目录）时 WARN 跳过，绝不递归删除，
+      // 与 S-6 整删名单的目录护栏同口径。
+      let legacyStat;
+      try { legacyStat = lstatSync(legacyPath); } catch { continue; }
+      if (legacyStat.isDirectory()) {
+        console.warn(`  ⚠️ WARN ${legacyPath} 是目录而非旧版残留文件：已跳过（不递归删除），请手工检查该目录。`);
+        continue;
       }
+      rmSync(legacyPath, { force: true });
+      agentsRemoved++;
     }
     if (agentsRemoved > 0) console.log(`  ✅ Claude Code agents: 移除 ${agentsRemoved} 个旧版残留 -> ${agentsDest}`);
     try {

@@ -129,3 +129,50 @@ test('S-6：整删名单条目被造成目录 -> 卸载 exit 0、WARN 跳过、�
     rmFixture(dir);
   }
 });
+
+test('R7：旧版 agents 残留同名条目是目录 -> 卸载 WARN 跳过不递归、标记保留；同名普通文件仍被精确清理', () => {
+  // 夹具 A：.claude/agents/code-reviewer.md 被造成目录（内含标记文件），
+  // 旁边再放一个用户自己的 agent 文件：卸载必须 WARN、绝不递归删，目录、标记、
+  // 用户文件与非空 agents 容器全部保留，也不得误报「移除旧版残留」成功行。
+  const dirA = mkFixture('jevzh-un-legacy-agents-dir-');
+  const bogusAgentsDir = path.join(dirA, '.claude', 'agents', 'code-reviewer.md');
+  try {
+    fs.mkdirSync(bogusAgentsDir, { recursive: true });
+    fs.writeFileSync(path.join(bogusAgentsDir, 'marker.txt'), '目录内容必须保留\n');
+    fs.writeFileSync(path.join(dirA, '.claude', 'agents', 'my-agent.md'), '# 用户自己的 agent\n');
+
+    const r = run(['--uninstall', '--tool', 'claude'], { cwd: dirA });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const out = r.stdout + r.stderr;
+    assert.match(out, /WARN/);
+    assert.match(out, /是目录/);
+    assert.match(out, /不递归删除/);
+    assert.doesNotMatch(out, /Claude Code agents: 移除/);
+
+    assert.ok(exists(bogusAgentsDir), '同名目录本身必须保留');
+    assert.ok(exists(path.join(bogusAgentsDir, 'marker.txt')), '目录内标记文件必须保留（不得递归删除）');
+    assert.equal(readText(path.join(bogusAgentsDir, 'marker.txt')), '目录内容必须保留\n');
+    assert.ok(exists(path.join(dirA, '.claude', 'agents', 'my-agent.md')));
+    assert.ok(exists(path.join(dirA, '.claude', 'agents')), 'agents 容器仍非空，必须保留');
+  } finally {
+    rmFixture(dirA);
+  }
+
+  // 夹具 B：正常的旧版残留文件（v1.2.x 的 code-reviewer.md）-> 仍被精确清理，
+  // 空容器一并删除，并报告移除成功。
+  const dirB = mkFixture('jevzh-un-legacy-agents-file-');
+  try {
+    fs.mkdirSync(path.join(dirB, '.claude', 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(dirB, '.claude', 'agents', 'code-reviewer.md'), '# legacy v1.2.x\n');
+
+    const r = run(['--uninstall', '--tool', 'claude'], { cwd: dirB });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const out = r.stdout + r.stderr;
+    assert.match(out, /Claude Code agents: 移除 1 个旧版残留/);
+    assert.doesNotMatch(out, /是目录/);
+    assert.ok(!exists(path.join(dirB, '.claude', 'agents', 'code-reviewer.md')));
+    assert.ok(!exists(path.join(dirB, '.claude', 'agents')), 'agents 容器清空后应一并删除');
+  } finally {
+    rmFixture(dirB);
+  }
+});

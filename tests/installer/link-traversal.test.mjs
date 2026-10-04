@@ -155,3 +155,80 @@ test('I-1/3：hooks 容器是链接时卸载只摘链不递归，scripts 正常�
     rmFixture(outside);
   }
 });
+
+test('R3：hooks 容器本身是链接 -> 安装不打 hooks ✅ 成功行、改打 SKIP，外部无损，scripts 正常落位', (t) => {
+  const proj = mkFixture('jevzh-link-hooks-install-proj-');
+  const outside = mkFixture('jevzh-link-hooks-install-out-');
+  const extHooks = path.join(outside, 'ext-hooks');
+  const linkHooks = path.join(proj, '.claude', 'hooks');
+  try {
+    fs.mkdirSync(path.join(proj, '.claude'), { recursive: true });
+    fs.mkdirSync(extHooks, { recursive: true });
+    // 外部预置内容，诱导旧逻辑 mkdir 后穿透覆盖 hooks.json。
+    fs.writeFileSync(path.join(extHooks, 'EXTERNAL-HOOKS.txt'), 'external-hooks\n');
+    fs.writeFileSync(path.join(extHooks, 'hooks.json'), '{"external": true}\n');
+    if (!makeDirLinkOrSkip(t, extHooks, linkHooks)) return;
+    const extBefore = hashTree(extHooks);
+
+    const r = run(['--tool', 'claude'], { cwd: proj });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const out = r.stdout + r.stderr;
+    // 旧逻辑 existsSync(hookDest) 对 junction 为真，误打 ✅ 成功行与 WARN 自相矛盾。
+    assert.doesNotMatch(out, /hooks 运行时 ->/, '不得出现该目标的 hooks ✅ 成功行');
+    assert.match(out, /跳过 hooks 运行时/, '必须有一致的 hooks 跳过说明');
+    assert.match(out, /符号链接|junction/);
+    // 链接目标一字节不动。
+    assert.equal(hashTree(extHooks), extBefore, '安装写入了 hooks 链接目标（外部被污染）');
+    assert.equal(
+      fs.readFileSync(path.join(extHooks, 'hooks.json'), 'utf8'),
+      '{"external": true}\n',
+    );
+    assert.ok(exists(path.join(extHooks, 'EXTERNAL-HOOKS.txt')));
+    assert.ok(lstatIsLink(linkHooks), 'hooks 容器链接应保留');
+    // 技能与独立的 scripts 容器（真实目录）照常安装。
+    assert.ok(exists(path.join(proj, '.claude', 'skills', 'brainstorming', 'SKILL.md')));
+    assert.ok(exists(path.join(proj, '.claude', 'scripts', 'jev-gate')));
+  } finally {
+    unlinkQuiet(linkHooks);
+    rmFixture(proj);
+    rmFixture(outside);
+  }
+});
+
+test('R1：直接父目录是链接（.claude 为 junction、skills 容器尚不存在）-> exit 0、父级链接披露、技能落在链接目标', (t) => {
+  const proj = mkFixture('jevzh-link-parent-proj-');
+  const outside = mkFixture('jevzh-link-parent-out-');
+  const realClaude = path.join(outside, 'claude-real');
+  const linkClaude = path.join(proj, '.claude');
+  try {
+    fs.mkdirSync(realClaude, { recursive: true });
+    fs.writeFileSync(path.join(realClaude, 'EXTERNAL-MARKER.txt'), 'external-keep\n');
+    if (!makeDirLinkOrSkip(t, realClaude, linkClaude)) return;
+
+    const r = run(['--tool', 'claude'], { cwd: proj });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const out = r.stdout + r.stderr;
+    assert.match(out, /WARN/);
+    assert.match(out, /直接父目录.*(符号链接|junction)/);
+    assert.match(out, /实际写入链接目标/);
+    assert.match(out, /不阻断/);
+
+    // 技能/hooks 确实落在链接目标（外部真实目录）内。
+    assert.ok(exists(path.join(realClaude, 'skills', 'brainstorming', 'SKILL.md')));
+    assert.ok(exists(path.join(realClaude, 'skills', 'brainstorming', '.jevzh-meta.json')));
+    assert.ok(exists(path.join(realClaude, 'skills', 'jev-verification', 'SKILL.md')));
+    assert.ok(exists(path.join(realClaude, 'hooks', 'hooks.json')));
+    // 表面路径经 junction 同样可见；容器本身是目标侧新建的真实目录（不是链接）。
+    assert.ok(exists(path.join(linkClaude, 'skills', 'brainstorming', 'SKILL.md')));
+    assert.equal(lstatIsLink(path.join(linkClaude, 'skills')), false, 'skills 容器应是真实目录而非链接');
+    // 外部既有内容保留。
+    assert.equal(
+      fs.readFileSync(path.join(realClaude, 'EXTERNAL-MARKER.txt'), 'utf8'),
+      'external-keep\n',
+    );
+  } finally {
+    unlinkQuiet(linkClaude);
+    rmFixture(proj);
+    rmFixture(outside);
+  }
+});
