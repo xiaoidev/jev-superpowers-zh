@@ -1,8 +1,9 @@
 // tests/installer/cli.test.mjs — CLI 品牌、帮助、版本与参数退出码
 import fs from 'node:fs';
+import path from 'node:path';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { BIN, ROOT_URL, run, mkFixture, rmFixture } from './helpers.mjs';
+import { BIN, ROOT_URL, run, mkFixture, rmFixture, hashTree, listFiles } from './helpers.mjs';
 
 const pkg = JSON.parse(
   fs.readFileSync(new URL('../../package.json', import.meta.url), 'utf8'),
@@ -102,4 +103,79 @@ test('bin/jevzh.js 存在且在 package.json 注册', () => {
 
 test('ROOT_URL 指向仓库根（夹具自检）', () => {
   assert.ok(fs.existsSync(new URL('skills/using-superpowers/SKILL.md', ROOT_URL)));
+});
+
+// ── S-1：--detect-only 只读语义与写操作互斥（任何文件操作前拦截，exit 64）──
+
+// 建一个可被 claude 目标检测到的项目夹具（.claude 容器存在）。
+function s1Fixture(prefix) {
+  const dir = mkFixture(prefix);
+  fs.mkdirSync(path.join(dir, '.claude'), { recursive: true });
+  return dir;
+}
+
+test('S-1：--detect-only --uninstall 互斥 -> exit 64、中文互斥提示、零写盘', () => {
+  const dir = s1Fixture('jevzh-s1-du-');
+  try {
+    const before = hashTree(dir);
+    const beforeList = listFiles(dir);
+    for (const args of [
+      ['--tool', 'claude', '--detect-only', '--uninstall'],
+      ['--tool', 'claude', '--detect-only', '-u'],
+    ]) {
+      const r = run(args, { cwd: dir });
+      assert.equal(r.status, 64, args.join(' ') + '\n' + r.stdout + r.stderr);
+      assert.match(r.stderr, /参数互斥/);
+      assert.match(r.stderr, /--detect-only/);
+      assert.match(r.stderr, /--uninstall\/-u|卸载/);
+    }
+    assert.equal(hashTree(dir), before, '互斥拒绝后发生了写盘');
+    assert.deepEqual(listFiles(dir), beforeList);
+  } finally {
+    rmFixture(dir);
+  }
+});
+
+test('S-1：restore <时间戳> --detect-only 互斥 -> exit 64、中文互斥提示、零写盘（不进 restore）', () => {
+  const dir = s1Fixture('jevzh-s1-dr-');
+  try {
+    const before = hashTree(dir);
+    const beforeList = listFiles(dir);
+    // 不存在的时间戳也无所谓：互斥校验在 restore() 之前，绝不能报「备份不存在」。
+    const r = run(['restore', '20990101-000000', '--detect-only'], { cwd: dir });
+    assert.equal(r.status, 64, r.stdout + r.stderr);
+    assert.match(r.stderr, /参数互斥/);
+    assert.match(r.stderr, /restore/);
+    assert.doesNotMatch(r.stdout + r.stderr, /备份不存在|找不到/);
+    assert.equal(hashTree(dir), before, '互斥拒绝后发生了写盘');
+    assert.deepEqual(listFiles(dir), beforeList);
+  } finally {
+    rmFixture(dir);
+  }
+});
+
+test('S-1：单独 --detect-only -> exit 0 只读零写盘（夹具树 sha256 不变）', () => {
+  const dir = s1Fixture('jevzh-s1-only-');
+  try {
+    const before = hashTree(dir);
+    const r = run(['--tool', 'claude', '--detect-only'], { cwd: dir });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(hashTree(dir), before, 'detect-only 发生了写盘');
+    assert.deepEqual(listFiles(dir), []);
+  } finally {
+    rmFixture(dir);
+  }
+});
+
+test('S-1：doctor --detect-only 放行 -> exit 0 只读（夹具树 sha256 不变）', () => {
+  const dir = s1Fixture('jevzh-s1-doc-');
+  try {
+    const before = hashTree(dir);
+    const r = run(['doctor', '--tool', 'claude', '--detect-only'], { cwd: dir });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.equal(hashTree(dir), before, 'doctor --detect-only 发生了写盘');
+    assert.deepEqual(listFiles(dir), []);
+  } finally {
+    rmFixture(dir);
+  }
 });

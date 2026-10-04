@@ -7,11 +7,17 @@ import path from 'node:path';
 import { pathToFileURL } from 'node:url';
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { run, mkFixture, rmFixture, readText } from './helpers.mjs';
+import { run, mkFixture, rmFixture, readText, exists } from './helpers.mjs';
 import { BIN } from '../installer/helpers.mjs';
 
 const mod = await import(pathToFileURL(BIN).href);
-const { cutForeignMarkedSections, scanAtxHeadings } = mod;
+const {
+  cutForeignMarkedSections,
+  scanAtxHeadings,
+  stripCodeBlocks,
+  maskInlineCodeSpans,
+  forEachMarkdownLine,
+} = mod;
 
 // 端到端：安装接管 CLAUDE.md（英文 obra/jev 旧段 -> 切除并写本包哨兵）。
 function migrateClaude(doc) {
@@ -423,4 +429,301 @@ test('I-1 单元：代码围栏内的 ## 标题既不是候选也不是边界，
   assert.match(r.text, /FC-FENCE-MARKER/);
   assert.match(r.text, /## User section/);
   assert.ok(!/^## Superpowers \(obra\)$/m.test(r.text.split('```')[2] || ''));
+});
+
+// ════════════════════════════════════════════════════════════════════════════
+// R-3：竞品检测必须围栏/4 空格缩排块/行内 code span 感知——文档里【演示旧命令】
+// 不等于文件被竞品接管。刻意取舍：检测侧用最简单的结构状态机（0-3 空格开栏、
+// 同字符同长度 info 空闭栏、4+ 空格/Tab 行即缩排代码），不做 CommonMark 空行
+// 与段落判定，宁可漏判（真竞品落在代码样式里也不切）也不误删用户文档。
+// ════════════════════════════════════════════════════════════════════════════
+
+test('R-3 单元：stripCodeBlocks 与原文【等长】且偏移一致（围栏/缩排/行内 span 掩码）', () => {
+  const doc = [
+    '# 标题 KEEP-R3U',
+    '',
+    '正文提到 `superpowers:using-superpowers` 行内 span。',
+    '',
+    '```js',
+    '// TypeSafe Jev / Failure Modes / jev-superpowers 都在围栏里',
+    'const x = "superpowers:using-superpowers";',
+    '```',
+    '',
+    '    四个空格缩排：docs/CONFIDENCE.md jev-using-superpowers',
+    '\tTab 缩排：TypeSafe Jev',
+    '',
+    '围栏外真命中：Failure Modes。',
+    '',
+  ].join('\n');
+  const probe = stripCodeBlocks(doc);
+  // 等长是「按原始下标切区间计数」正确性的前提。
+  assert.equal(probe.length, doc.length, '正文视图必须与原文等长');
+  assert.ok(!probe.includes('superpowers:using-superpowers'), '围栏/span 命中未掩码');
+  assert.ok(!probe.includes('TypeSafe Jev'), '围栏/Tab 缩排命中未掩码');
+  assert.ok(!probe.includes('docs/CONFIDENCE.md'), '4 空格缩排命中未掩码');
+  assert.ok(!probe.includes('jev-using-superpowers'));
+  assert.ok(!probe.includes('jev-superpowers'));
+  // 正文（含围栏外真命中、普通文字、反引号外的中文）原样可见。
+  assert.match(probe, /围栏外真命中：Failure Modes。/);
+  assert.match(probe, /# 标题 KEEP-R3U/);
+  assert.match(probe, /正文提到/);
+  // 行内 span 只掩码 span 本身：反引号前后的中文仍在原位（偏移不变）。
+  assert.equal(probe.indexOf('正文提到'), doc.indexOf('正文提到'));
+  assert.equal(probe.indexOf('行内 span。'), doc.indexOf('行内 span。'));
+
+  // forEachMarkdownLine 的 offset 与原文行首下标一致，inCode 标注符合预期。
+  const seen = [];
+  forEachMarkdownLine(doc, ({ line, offset, inCode }) => seen.push({ line, offset, inCode }));
+  for (const s of seen) {
+    // 直接按 offset 切片比对（indexOf 对空串恒为 0，不能用于空行）。
+    assert.equal(doc.slice(s.offset, s.offset + s.line.length), s.line, `offset 错位: ${s.line}`);
+  }
+  assert.ok(seen.find(s => s.line.startsWith('const x'))?.inCode);
+  assert.ok(seen.find(s => s.line.startsWith('    四个空格'))?.inCode);
+  assert.ok(seen.find(s => s.line.startsWith('\tTab 缩排'))?.inCode);
+  assert.equal(seen.find(s => s.line.startsWith('围栏外真命中'))?.inCode, false);
+  assert.equal(seen.find(s => s.line.startsWith('正文提到'))?.inCode, false);
+});
+
+test('R-3 单元：maskInlineCodeSpans 等长掩码；等长 run 配对；未闭合 run 按字面保留', () => {
+  const s1 = 'a `code` b';
+  assert.equal(maskInlineCodeSpans(s1).length, s1.length);
+  // 'a' + 反引号前原空格 + 6 个 span 字符掩码 + 闭反引号后原空格 + 'b' = 中间 8 空格。
+  assert.match(maskInlineCodeSpans(s1), /^a {8}b$/);
+  // 双反引号 run 内含单反引号：``a`b`` 是合法 span（7 字符），整体掩码且等长。
+  const s2 = 'x ``a`b`` y';
+  const paired = maskInlineCodeSpans(s2);
+  assert.equal(paired.length, s2.length);
+  assert.ok(!paired.includes('a`b'));
+  assert.match(paired, /^x {9}y$/);
+  // 未闭合 run：CommonMark 视为字面文本，原样返回（不扩大剔除面）。
+  const unclosed = 'just `superpowers:using-superpowers no closing run';
+  assert.equal(maskInlineCodeSpans(unclosed), unclosed);
+  // 无反引号行恒等。
+  assert.equal(maskInlineCodeSpans('普通正文 Failure Modes'), '普通正文 Failure Modes');
+});
+
+test('R-3 单元：scanAtxHeadings 跳过围栏/缩排块内标题；~~~ 与反引号围栏等价', () => {
+  const doc = [
+    '# H1 真标题',
+    '',
+    '~~~',
+    '## 波浪围栏标题',
+    '~~~',
+    '',
+    '    ## 四空格缩排不是标题',
+    '\t## Tab 缩排不是标题',
+    '',
+    '## H2 真标题',
+    '',
+    '```',
+    '### 反引号围栏标题',
+    '', // 未闭合围栏：其后所有行持续 inCode，直到 EOF
+  ].join('\n');
+  const titles = scanAtxHeadings(doc).map(h => h.text);
+  assert.deepEqual(titles, ['H1 真标题', 'H2 真标题']);
+});
+
+test('R-3 单元：竞品命中只存在于代码结构内 -> cut=false 且 unresolvable=false（干净路径）', () => {
+  const doc = [
+    '# Project',
+    '',
+    '文档演示旧命令：',
+    '',
+    '```',
+    '## Superpowers (obra)',
+    'superpowers:using-superpowers Failure Modes TypeSafe Jev',
+    'jev-using-superpowers docs/CONFIDENCE.md jev-superpowers',
+    '```',
+    '',
+    '    superpowers:using-superpowers Failure Modes（缩排块）',
+    '',
+    '正文也可提 `superpowers:using-superpowers` 行内 code。',
+    '',
+  ].join('\n');
+  const r = cutForeignMarkedSections(doc);
+  assert.equal(r.cut, false);
+  assert.equal(r.unresolvable, false);
+  assert.equal(r.text, doc);
+});
+
+test('R-3 a（端到端）：竞品串只在 ```js 围栏内 -> 干净追加路径，围栏字节原样保留', () => {
+  const doc = [
+    '# 我的项目',
+    '',
+    'KEEP-R3A-PRE 项目说明。',
+    '',
+    '```js',
+    '// 旧文档示例（历史保留，勿删）：',
+    '// invoke superpowers:using-superpowers, see Failure Modes',
+    '// TypeSafe Jev / jev-using-superpowers / docs/CONFIDENCE.md / jev-superpowers',
+    'const legacy = "R3A-FENCE-MARKER";',
+    '```',
+    '',
+    'KEEP-R3A-TAIL 围栏之后的正文。',
+    '',
+  ].join('\n');
+  const dir = migrateClaude(doc);
+  try {
+    const r = run(['--tool', 'claude'], { cwd: dir });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const out = r.stdout + r.stderr;
+    assert.doesNotMatch(out, /\[MIGRATE\]/, '围栏内演示不得触发 MIGRATE');
+    const after = readText(path.join(dir, 'CLAUDE.md'));
+    // 围栏整块（含全部「竞品串」演示行与闭合标记）逐字节保留。
+    assert.match(after, /R3A-FENCE-MARKER/);
+    assert.match(after, /invoke superpowers:using-superpowers, see Failure Modes/);
+    assert.match(after, /TypeSafe Jev \/ jev-using-superpowers \/ docs\/CONFIDENCE\.md \/ jev-superpowers/);
+    assert.equal((after.match(/```js/g) ?? []).length, 1);
+    assert.match(after, /KEEP-R3A-PRE/);
+    assert.match(after, /KEEP-R3A-TAIL/);
+    // 干净文件：本包 bootstrap 正常追加。
+    assert.match(after, /jev-superpowers-zh:begin/);
+    assert.equal((after.match(/jev-superpowers-zh:begin/g) ?? []).length, 1);
+    assert.ok(exists(path.join(dir, '.claude', 'skills', 'using-superpowers', 'SKILL.md')), '技能正常安装');
+  } finally {
+    rmFixture(dir);
+  }
+});
+
+test('R-3 b（端到端）：围栏内假竞品段保留 + 围栏外真竞品段精确切除（MIGRATE 只切真段）', () => {
+  const doc = [
+    '# 我的项目',
+    '',
+    'KEEP-R3B-PRE。',
+    '',
+    '```markdown',
+    '## Superpowers (obra)',
+    '围栏演示：superpowers:using-superpowers 与 Failure Modes 只是文档示例 R3B-FENCE-MARKER。',
+    '```',
+    '',
+    '## Superpowers (obra)',
+    '',
+    'R3B-REAL-MARKER 真段正文：superpowers:using-superpowers plus Failure Modes。',
+    '',
+    '## 用户章节',
+    '',
+    'KEEP-R3B-USER：真竞品段之后的用户内容必须保留。',
+    '',
+  ].join('\n');
+  const dir = migrateClaude(doc);
+  try {
+    const r = run(['--tool', 'claude'], { cwd: dir });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.match(r.stdout + r.stderr, /\[MIGRATE\]/);
+    const after = readText(path.join(dir, 'CLAUDE.md'));
+    // 围栏整块原样保留（围栏里的假标题/假特征都在）。
+    assert.match(after, /R3B-FENCE-MARKER/);
+    assert.match(after, /围栏演示：superpowers:using-superpowers 与 Failure Modes/);
+    assert.equal((after.match(/```markdown/g) ?? []).length, 1);
+    // 围栏外真段切除。
+    assert.ok(!after.includes('R3B-REAL-MARKER'), `真竞品段残留:\n${after}`);
+    // 真段标题切了、围栏内标题文本保留（作为围栏内容出现 1 次）。
+    const headingOccurrences = after.match(/## Superpowers \(obra\)/g) ?? [];
+    assert.equal(headingOccurrences.length, 1, '应只剩围栏内那一处假标题');
+    assert.match(after, /## 用户章节/);
+    assert.match(after, /KEEP-R3B-USER/);
+    assert.match(after, /KEEP-R3B-PRE/);
+    assert.match(after, /jev-superpowers-zh:begin/);
+  } finally {
+    rmFixture(dir);
+  }
+});
+
+test('R-3 c（端到端）：竞品串只在 4 空格缩排代码块内 -> 干净追加，缩排行字节保留', () => {
+  const doc = [
+    '# 我的项目',
+    '',
+    'KEEP-R3C-PRE。',
+    '',
+    '    superpowers:using-superpowers Failure Modes R3C-INDENT-MARKER',
+    '    jev-using-superpowers docs/CONFIDENCE.md TypeSafe Jev jev-superpowers',
+    '',
+    'KEEP-R3C-TAIL。',
+    '',
+  ].join('\n');
+  const dir = migrateClaude(doc);
+  try {
+    const r = run(['--tool', 'claude'], { cwd: dir });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.doesNotMatch(r.stdout + r.stderr, /\[MIGRATE\]/);
+    const after = readText(path.join(dir, 'CLAUDE.md'));
+    assert.match(after, /R3C-INDENT-MARKER/);
+    assert.match(after, / {4}jev-using-superpowers docs\/CONFIDENCE\.md/);
+    assert.match(after, /KEEP-R3C-PRE/);
+    assert.match(after, /KEEP-R3C-TAIL/);
+    assert.match(after, /jev-superpowers-zh:begin/);
+  } finally {
+    rmFixture(dir);
+  }
+});
+
+test('R-3 d（端到端）：竞品串只在行内 code span 内 -> 干净追加，原句逐字保留', () => {
+  const doc = [
+    '# 我的项目',
+    '',
+    'KEEP-R3D-PRE。',
+    '',
+    '排障时先读 `docs/CONFIDENCE.md`；旧命令 `superpowers:using-superpowers` 仅作历史参考；',
+    '技能 `jev-using-superpowers` 已改名；英文品牌 `TypeSafe Jev` 与 `Failure Modes` R3D-SPAN-MARKER 不再出现于正文。',
+    '',
+    'KEEP-R3D-TAIL。',
+    '',
+  ].join('\n');
+  const dir = migrateClaude(doc);
+  try {
+    const r = run(['--tool', 'claude'], { cwd: dir });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.doesNotMatch(r.stdout + r.stderr, /\[MIGRATE\]/);
+    const after = readText(path.join(dir, 'CLAUDE.md'));
+    assert.match(after, /R3D-SPAN-MARKER/);
+    assert.match(after, /`superpowers:using-superpowers`/);
+    assert.match(after, /`TypeSafe Jev`/);
+    assert.match(after, /KEEP-R3D-PRE/);
+    assert.match(after, /KEEP-R3D-TAIL/);
+    assert.match(after, /jev-superpowers-zh:begin/);
+  } finally {
+    rmFixture(dir);
+  }
+});
+
+test('R-3 e（端到端）：品牌标题但段内特征不足 -> unresolvable：rc0 文件不动技能照装，stdout 明示路由未接管', () => {
+  const doc = [
+    '# 我的项目',
+    '',
+    'KEEP-R3E-PRE。',
+    '',
+    '## Superpowers (obra)',
+    '',
+    '本段只有 superpowers:using-superpowers 一个高置信特征，证据不足无法定界 R3E-WEAK。',
+    '',
+    '## 用户章节',
+    '',
+    'KEEP-R3E-USER。',
+    '',
+  ].join('\n');
+  const dir = migrateClaude(doc);
+  try {
+    const r = run(['--tool', 'claude'], { cwd: dir });
+    assert.equal(r.status, 0, r.stdout + r.stderr); // 退出码语义不变：unresolvable 仍 0
+    const out = r.stdout + r.stderr;
+    // stderr 详细 WARN 保留（I-1′ d 既有断言口径）。
+    assert.match(out, /WARN/);
+    assert.match(out, /边界不可判定/);
+    // R-3：结局必须在 stdout 可见（不能只留 stderr 一句告警）。
+    assert.match(r.stdout, /路由未接管/);
+    assert.match(r.stdout, /需手工处理/);
+    assert.match(r.stdout, /技能已安装/);
+    assert.match(r.stdout, /CLAUDE\.md/);
+    // 安装汇总点名。
+    assert.match(r.stdout, /另有 1 个 router 文件路由未接管/);
+    // 文件字节不动、本包区块绝不追加。
+    assert.equal(readText(path.join(dir, 'CLAUDE.md')), doc);
+    assert.match(readText(path.join(dir, 'CLAUDE.md')), /R3E-WEAK/);
+    assert.doesNotMatch(readText(path.join(dir, 'CLAUDE.md')), /jev-superpowers-zh:begin/);
+    // 技能照常安装（路由没接管不等于整单失败）。
+    assert.ok(exists(path.join(dir, '.claude', 'skills', 'using-superpowers', 'SKILL.md')), '技能应已安装');
+  } finally {
+    rmFixture(dir);
+  }
 });

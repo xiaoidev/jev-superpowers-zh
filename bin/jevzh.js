@@ -289,11 +289,14 @@ const FALLBACK_TAIL_HINTS = [
 // 其他发行版（superpowers-zh / jev-superpowers）占用同一 bootstrap 文件的特征。
 // obra 无哨兵无固定标记，任务 7 preflight 再做短语级识别；任务 6 只覆盖可精确
 // 判定的 zh / jev 痕迹，命中即 WARN 不动。
+// R-3：只在代码结构感知的「正文视图」上判定——代码围栏/4 空格缩排块/行内 code
+// span 内演示旧命令、旧哨兵的文档不算竞品文件（调用方需先剥本包成对区块）。
 function containsCompetitorSection(text) {
-  if (text.includes(ZH_SENTINEL_BEGIN) || text.includes(ZH_SENTINEL_END)) return true;
-  if (ZH_SECTION_MARKERS.some(m => text.includes(m))) return true;
-  if (text.includes('superpowers-zh')) return true;
-  if (text.includes('jev-using-superpowers') || text.includes('TypeSafe Jev')) return true;
+  const p = stripCodeBlocks(text);
+  if (p.includes(ZH_SENTINEL_BEGIN) || p.includes(ZH_SENTINEL_END)) return true;
+  if (ZH_SECTION_MARKERS.some(m => p.includes(m))) return true;
+  if (p.includes('superpowers-zh')) return true;
+  if (p.includes('jev-using-superpowers') || p.includes('TypeSafe Jev')) return true;
   return false;
 }
 
@@ -1207,15 +1210,20 @@ function routerDescriptor(target, isGlobal) {
 
 // router 正文状态分析（悬空/本包区块/竞品痕迹）。
 function analyzeRouterText(text) {
+  // 哨兵计数必须在【原文】上做：oursMarkers/oursTargets 是幂等跳过依据
+  //（state.oursTargets.includes(target) 必须在剥区块之前识别已装 target），
+  // 若先剥本包区块再计数，重跑会把自己判成「无本包区块」而重复追加。
   const oursMarkers = [...text.matchAll(new RegExp(OUR_BEGIN_RE.source, 'g'))].map(m => m[0]);
   const oursBegin = oursMarkers.length;
   const oursEnd = countOccurrences(text, SENTINEL_END);
   const zhBegin = countOccurrences(text, ZH_SENTINEL_BEGIN);
   const zhEnd = countOccurrences(text, ZH_SENTINEL_END);
-  // 竞品判定必须先剔除本包成对区块：区块内的技能表天然含有
-  // jev-using-superpowers / TypeSafe Jev 等字样，不能据此判自己为竞品
-  // （否则 S-9 多 target 共享文件时第二个 target 会被误挡、无法追加区块）。
+  // 竞品判定顺序（R-3）：先剥本包成对区块（区块内技能表天然含 jev-using-superpowers
+  // /TypeSafe Jev 等字样，不能据此判自己为竞品——S-9 多 target 共享文件否则第二个
+  // target 会被误挡）-> 再掩码代码块/行内 code span（围栏里演示旧命令不算竞品）
+  // -> 最后只在正文视图上判品牌词。
   const stripped = cutPairedSections(text, OUR_BEGIN_RE, SENTINEL_END).text;
+  const probe = stripCodeBlocks(stripped);
   return {
     oursBegin,
     oursEnd,
@@ -1224,9 +1232,9 @@ function analyzeRouterText(text) {
     zhEnd,
     danglingZh: zhBegin !== zhEnd,
     oursTargets: oursMarkers.map(markerTargetName),
-    hasCompetitor: containsCompetitorSection(stripped)
-      || /superpowers:[a-z]/i.test(stripped)
-      || (stripped.includes('TypeSafe Jev') && !CJK_RE.test(stripped)),
+    hasCompetitor: containsCompetitorSection(probe)
+      || /superpowers:[a-z]/i.test(probe)
+      || (probe.includes('TypeSafe Jev') && !CJK_RE.test(probe)),
   };
 }
 
@@ -1369,41 +1377,98 @@ function isInsideDir(baseDir, abs) {
   return p === b || p.startsWith(b + sep);
 }
 
-// 朴素 ATX 标题扫描（围栏感知）：
-//   - 识别 0~3 空格缩进的 1~6 级 ATX 标题，返回相对原文的字符下标；
-//   - 跳过 ``` / ~~~ 代码围栏内的行（围栏长度 >=3、同类围栏且长度不短于开围栏
-//     才算闭合，闭合围栏不得带 info string），避免把代码示例里的 markdown 标题
-//     误当边界；
-//   - 已知限制：不解析跨行 inline code 反引号段（极少见），这类行理论上可能被
-//     误判为标题；与 cutPairedSections / cutLegacyZhMarkedSection 同属保守的
-//     行级扫描，切除前仍有「段内 >=2 高置信特征」门槛兜底。
-function scanAtxHeadings(content) {
-  const heads = [];
-  const fenceRe = /^[ \t]{0,3}(`{3,}|~{3,})(.*)$/;
+// Markdown 代码结构状态机（检测侧与标题扫描共用，避免两份规则漂移）：
+//  · 围栏代码块：行首 ≤3 个空格/Tab 的 ```/~~~ 开栏；同字符、长度不短于开栏且
+//    info 串为空的围栏行闭栏；
+//  · 缩排代码块：4+ 空格或 Tab 开头的行（CommonMark 还要求其前有空行/不能打断
+//    段落，这里不区分——检测侧宁可漏判也不把演示文本当成真竞品，见 R-3 取舍说明）。
+// 竞品/品牌词/特征检测只能落在「正文行」：用户在代码块里演示旧命令、旧哨兵并不
+// 等于文件真的被竞品接管。
+const FENCE_LINE_RE = /^[ \t]{0,3}(`{3,}|~{3,})(.*)$/;
+const INDENTED_CODE_RE = /^(?: {4,}|\t)/;
+
+// 把一行内的反引号 code span 掩码为等长空格（含 `code` 与 ``a`b`` 等长反引号 run
+// 配对形式）；等长掩码而非删除，保证「正文视图」与原文逐字符偏移一致，可直接按
+// 原始下标切片。未闭合的反引号 run 按 CommonMark 视为字面文本保留（不扩大剔除面）。
+function maskInlineCodeSpans(line) {
+  const runs = [];
+  const re = /`+/g;
+  let m;
+  while ((m = re.exec(line))) runs.push({ i: m.index, n: m[0].length });
+  if (runs.length === 0) return line;
+  let out = '';
+  let cursor = 0;
+  for (let k = 0; k < runs.length; k++) {
+    const open = runs[k];
+    let closeIdx = -1;
+    for (let j = k + 1; j < runs.length; j++) {
+      if (runs[j].n === open.n) { closeIdx = j; break; }
+    }
+    if (closeIdx === -1) { out += line.slice(cursor); cursor = line.length; break; }
+    out += line.slice(cursor, open.i);
+    out += ' '.repeat(runs[closeIdx].i + runs[closeIdx].n - open.i); // 开闭反引号及内容整体掩码
+    cursor = runs[closeIdx].i + runs[closeIdx].n;
+    k = closeIdx;
+  }
+  out += line.slice(cursor);
+  return out;
+}
+
+// 逐行扫描并回调 { raw, line, offset, inCode }；offset 口径与旧 scanAtxHeadings
+// 完全一致（按原始行长度 +\n 计数，保留可能的 \r）。
+function forEachMarkdownLine(content, cb) {
   const lines = content.split('\n');
   let offset = 0;
   let fence = null; // { char: '`' | '~', len: number }
   for (const raw of lines) {
     const line = raw.replace(/\r$/, '');
+    let inCode = false;
     if (fence) {
-      const fm = fenceRe.exec(line);
+      inCode = true;
+      const fm = FENCE_LINE_RE.exec(line);
       if (fm && fm[1][0] === fence.char && fm[1].length >= fence.len && fm[2].trim() === '') {
         fence = null;
       }
     } else {
-      const fm = fenceRe.exec(line);
+      const fm = FENCE_LINE_RE.exec(line);
       if (fm) {
         fence = { char: fm[1][0], len: fm[1].length };
-      } else {
-        const hm = /^[ \t]{0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$/.exec(line);
-        if (hm) {
-          const text = String(hm[2] || '').replace(/[ \t]+#+[ \t]*$/, '').trim();
-          heads.push({ index: offset, level: hm[1].length, text });
-        }
+        inCode = true; // 围栏开栏行（含 info 串）本身也不是正文
+      } else if (INDENTED_CODE_RE.test(line)) {
+        inCode = true;
       }
     }
+    cb({ raw, line, offset, inCode });
     offset += raw.length + 1; // \n 本身占 1 字符（raw 保留可能的 \r）
   }
+}
+
+// 检测专用「正文视图」：与原文【等长、逐字符偏移一致】——代码行整体掩码为空格，
+// 正文行掩码行内 code span，换行保留。所有 includes/regex 竞品检测只许跑在这份
+// 文本上，且可安全按原始下标切片。
+function stripCodeBlocks(content) {
+  const out = [];
+  forEachMarkdownLine(content, ({ raw, inCode }) => {
+    out.push(inCode ? ' '.repeat(raw.length) : maskInlineCodeSpans(raw));
+  });
+  return out.join('\n');
+}
+
+// 朴素 ATX 标题扫描（复用上面的代码结构状态机）：
+//   - 识别 0~3 空格缩进的 1~6 级 ATX 标题，返回相对原文的字符下标；
+//   - 围栏/缩排代码块内的行一律跳过，避免把代码示例里的 markdown 标题误当边界；
+//   - 已知限制：不解析跨行 inline code 反引号段（极少见），这类行理论上可能被
+//     误判为标题；切除前仍有「段内 >=2 高置信特征」门槛兜底。
+function scanAtxHeadings(content) {
+  const heads = [];
+  forEachMarkdownLine(content, ({ line, offset, inCode }) => {
+    if (inCode) return;
+    const hm = /^[ \t]{0,3}(#{1,6})(?:[ \t]+(.*?))?[ \t]*$/.exec(line);
+    if (hm) {
+      const text = String(hm[2] || '').replace(/[ \t]+#+[ \t]*$/, '').trim();
+      heads.push({ index: offset, level: hm[1].length, text });
+    }
+  });
   return heads;
 }
 
@@ -1416,10 +1481,14 @@ const FOREIGN_SECTION_FEATURES = [
   'docs/CONFIDENCE.md', 'superpowers:using-superpowers', 'jev-superpowers',
 ];
 function cutForeignMarkedSections(content) {
-  if (!FOREIGN_SECTION_FEATURES.some(f => content.includes(f))) return { text: content, cut: false, unresolvable: false };
+  // R-3：快速排除与后续特征计数都只看「正文视图」——代码围栏/缩排块/行内 code
+  // span 里的演示文本（文档里教旧命令怎么写）绝不能触发竞品切除。
+  const probe = stripCodeBlocks(content);
+  if (!FOREIGN_SECTION_FEATURES.some(f => probe.includes(f))) return { text: content, cut: false, unresolvable: false };
   const all = scanAtxHeadings(content);
   const brandRe = /superpowers|typesafe\s*jev/i;
-  const candidates = all.filter(h => brandRe.test(h.text));
+  // 标题里的行内 code span 同样掩码后再判品牌词（如 ## 如何使用 `superpowers:xxx`）。
+  const candidates = all.filter(h => brandRe.test(maskInlineCodeSpans(h.text)));
   if (candidates.length === 0) return { text: content, cut: false, unresolvable: true };
   // 先在【原始文本】上为每个候选段独立计算 [start,end)：只在全部标题序列里找
   // 边界，用户自写标题（无品牌词）同样能终止切除，绝不一路吞到 EOF。
@@ -1432,9 +1501,11 @@ function cutForeignMarkedSections(content) {
     return { start: h.index, end };
   });
   // 任一段高置信特征不足 -> 边界/归属存疑，保守整文件保留（不做部分切除）。
+  // 特征计数只数正文行：围栏/缩排/行内 code 内的命中不计（probe 与原文等行数，
+  // 直接对同一下标区间切片即可）。
   for (const r of ranges) {
-    const section = content.slice(r.start, r.end);
-    const hits = FOREIGN_SECTION_FEATURES.filter(f => section.includes(f)).length;
+    const sectionProbe = probe.slice(r.start, r.end);
+    const hits = FOREIGN_SECTION_FEATURES.filter(f => sectionProbe.includes(f)).length;
     if (hits < 2) return { text: content, cut: false, unresolvable: true };
   }
   // 候选区间可能【嵌套包含】（如 ## Superpowers (obra) 内含
@@ -1803,7 +1874,9 @@ function printPlanMatrix(plan, opts) {
   }
   for (const r of plan.router) {
     if (r.status === 'migrate') {
-      console.log(`  [MIGRATE] ${r.rel}：检测到旧发行版引导段，将备份整文件后精确切除并写入本包成对哨兵（用户内容保留）`);
+      // R-3：[MIGRATE] 标签只在真正切除成功的写盘路径打印；预检阶段只是预判，
+      // 用 [待迁移] 并如实说明「边界不可判时整文件保留 + 路由未接管」的兜底结局。
+      console.log(`  [待迁移] ${r.rel}：检测到旧发行版引导段；实际安装时将备份整文件后尝试精确切除并写入本包成对哨兵（用户内容保留）。若旧段边界不可判定会整文件保留，并在结果中明确标注「路由未接管，需手工处理」，绝不静默跳过。`);
     } else if (r.status === 'dangling') {
       console.log(`  [WARN]    ${r.rel}：哨兵 begin 无配对 end（悬空/畸形），不接管不追加，请手工修复标记`);
     } else if (r.status === 'keep') {
@@ -1860,7 +1933,10 @@ function findNpmCliJs() {
 function npmGlobalRoot() {
   const injected = process.env.JEVZH_TEST_NPM_ROOT_G;
   if (injected !== undefined) return injected.trim() || null;
-  const args = ['root', '-g'];
+  // --logs-max=0：npm 11 即便 exit 0 也会在 cache/_logs 落一份 *-debug-0.log
+  //（Windows 回退路径污染伪造 LOCALAPPDATA 夹具的幂等指纹）；实测两条 spawn 路径
+  // 加该参数后均不再产生日志且 root -g 输出不变（npm 11.12 / node 24 验证）。
+  const args = ['root', '-g', '--logs-max=0'];
   let r = null;
   try {
     r = spawnSync('npm', args, { encoding: 'utf8', timeout: 3000, shell: false, windowsHide: true });
@@ -1880,11 +1956,13 @@ function npmGlobalRoot() {
 }
 
 // 文件是否含任一发行版（jevzh / 旧 superpowers-zh）痕迹：两类哨兵或品牌/增量标记。
+// R-3：同样先掩码代码块/行内 code span，文档代码示例里的品牌串不算安装痕迹。
 function fileHasDistroMark(abs) {
   let t;
   try { t = readFileSync(abs, 'utf8'); } catch { return false; }
-  return t.includes(SENTINEL_BEGIN) || t.includes(ZH_SENTINEL_BEGIN)
-    || t.includes(PKG.name) || t.includes(FORK_MARK);
+  const p = stripCodeBlocks(t);
+  return p.includes(SENTINEL_BEGIN) || p.includes(ZH_SENTINEL_BEGIN)
+    || p.includes(PKG.name) || p.includes(FORK_MARK);
 }
 
 // 技能目录是否含本包 meta 或 zh/jevzh 旧标记技能（限量只读扫描，best-effort 不拖累）。
@@ -2209,6 +2287,10 @@ function createTargetTransaction(run, target, baseDir, isGlobal, opts) {
     emptyDirs: [],
     pruneRoots: new Set(),
     warnings: [],
+    // R-3：检测到竞品但最终整文件保留、本包 bootstrap 未写入的 router 文件
+    //（边界不可判定等 unresolvable 场景）。stderr WARN 之外必须在 stdout 有
+    // 可见结果行，并在安装汇总里点名——不能只留一句告警静默不接管。
+    manualRouters: [],
     // 事务开始前就已存在的目录（如夹具/用户预置的 .claude 容器）：回滚剪空时
     // 绝不能移除——否则自动检测在重跑时会丢失目标标记（用例 8 自愈前提）。
     preExistingDirs: new Set(),
@@ -2278,6 +2360,14 @@ function createTargetTransaction(run, target, baseDir, isGlobal, opts) {
     },
     appendShared(abs, body, label) {
       const rel = relFromBase(baseDir, abs);
+      // unresolvable 结局统一出口：stderr 保留详细 WARN，另在 stdout 打一条
+      // 不可忽略的 [路由未接管] 结果行并计入汇总（R-3：不能只在 stderr 静默）。
+      const noteManualRouter = () => {
+        this.manualRouters.push(rel);
+        console.log(`  ⚠️ [路由未接管] ${label} ${rel}：检测到旧发行版引导痕迹但未能安全精确切除，`
+          + '该文件路由未接管、需手工处理（文件原样保留、本包 bootstrap 未写入；同名技能已正常安装；'
+          + '手工删除旧段后重跑本命令即可补写本包区块）。');
+      };
       let st;
       try { st = lstatSync(abs); } catch { st = null; }
       if (st && st.isSymbolicLink()) {
@@ -2319,6 +2409,7 @@ function createTargetTransaction(run, target, baseDir, isGlobal, opts) {
           const msg = `${label}: ${abs} 旧 superpowers-zh 哨兵畸形（嵌套/无法配对），整文件保留请手工处理。`;
           console.warn(`  ⚠️ WARN ${msg}`);
           this.warnings.push(msg);
+          noteManualRouter();
           return;
         }
         text = zhPair.text;
@@ -2327,6 +2418,7 @@ function createTargetTransaction(run, target, baseDir, isGlobal, opts) {
           const msg = `${label}: ${abs} 旧 superpowers-zh 区段边界不可识别，整文件保留请手工处理。`;
           console.warn(`  ⚠️ WARN ${msg}`);
           this.warnings.push(msg);
+          noteManualRouter();
           return;
         }
         text = legacy.text;
@@ -2335,6 +2427,7 @@ function createTargetTransaction(run, target, baseDir, isGlobal, opts) {
           const msg = `${label}: ${abs} 含英文 jev/obra 旧引导但边界不可判定，整文件保留请手工处理。`;
           console.warn(`  ⚠️ WARN ${msg}`);
           this.warnings.push(msg);
+          noteManualRouter();
           return;
         }
         text = foreign.text;
@@ -2342,6 +2435,7 @@ function createTargetTransaction(run, target, baseDir, isGlobal, opts) {
           const msg = `${label}: ${abs} 含竞品引导痕迹但无法安全精确切除，整文件保留（可手工删除旧段后重跑）。`;
           console.warn(`  ⚠️ WARN ${msg}`);
           this.warnings.push(msg);
+          noteManualRouter();
           return;
         }
         run.captureFile(target.name, abs, rel, true);
@@ -2903,26 +2997,26 @@ function verifyRestoredEntries(absFor, entries) {
     const abs = absFor(e);
     let st;
     try { st = lstatSync(abs); } catch { st = null; }
-    if (!st) { failures.push({ rel: e.relPath, reason: '恢复后目标不存在' }); continue; }
+    if (!st) { failures.push({ relPath: e.relPath, reason: '恢复后目标不存在' }); continue; }
     if (e.kind === 'dir') {
-      if (!st.isDirectory()) { failures.push({ rel: e.relPath, reason: '恢复后目标不是目录' }); continue; }
+      if (!st.isDirectory()) { failures.push({ relPath: e.relPath, reason: '恢复后目标不是目录' }); continue; }
       if (Array.isArray(e.files)) {
         const missing = e.files.find(f => !existsSync(resolve(abs, f)));
-        if (missing) failures.push({ rel: e.relPath, reason: `恢复后目录不完整，缺少：${missing}` });
+        if (missing) failures.push({ relPath: e.relPath, reason: `恢复后目录不完整，缺少：${missing}` });
       }
       continue;
     }
-    if (!st.isFile()) { failures.push({ rel: e.relPath, reason: '恢复后目标不是文件' }); continue; }
+    if (!st.isFile()) { failures.push({ relPath: e.relPath, reason: '恢复后目标不是文件' }); continue; }
     const got = fileIntegrity(abs);
     if (e.sha256) {
       if (got.sha256 !== e.sha256) {
         failures.push({
-          rel: e.relPath,
+          relPath: e.relPath,
           reason: `写后 sha256 不一致：期望 ${e.sha256.slice(0, 16)}…，实际 ${got.sha256.slice(0, 16)}…`,
         });
       }
     } else if (typeof e.size === 'number' && got.size !== e.size) {
-      failures.push({ rel: e.relPath, reason: `写后大小不一致（弱校验）：期望 ${e.size} 字节，实际 ${got.size} 字节` });
+      failures.push({ relPath: e.relPath, reason: `写后大小不一致（弱校验）：期望 ${e.size} 字节，实际 ${got.size} 字节` });
     }
   }
   return failures;
@@ -3408,7 +3502,7 @@ function showHelp() {
     npx jevzh --strict          新生成的 .jevzh.json 默认 strict:true（已存在的配置不覆盖）
     npx jevzh --uninstall       卸载当前目录（加 --global 卸载全局；.jevzh.json 默认保留）
     npx jevzh --force           允许在用户主目录(~)做项目级安装（默认拒绝）
-    npx jevzh --detect-only      只做共存预检并打印五级处置矩阵，绝不写盘（有 BLOCK 时 exit 2）
+    npx jevzh --detect-only      只做共存预检并打印五级处置矩阵，绝不写盘（有 BLOCK 时 exit 2；与 --uninstall、restore 互斥）
     npx jevzh --adopt-skills     备份后接管同名他方技能（superpowers-zh/jev/obra/未知）
     npx jevzh --keep-router      保留旧发行版引导段/规则文件，不切除不合并 hooks 配置
     npx jevzh doctor             只读诊断（竞品/归属/SKIP 残留/hooks/就绪/备份）
@@ -3441,29 +3535,6 @@ function showHelp() {
     共同方法论上游               https://github.com/obra/superpowers
     门禁技能来源                 https://github.com/AkashPriyadarshii/jev-superpowers
 `);
-}
-
-function installForTarget(target, baseDir, isGlobal, opts) {
-  installSkillsForTarget(target, baseDir, isGlobal, opts);
-
-  if (target.name === 'Trae') generateTraeBootstrapRule(baseDir, opts);
-  if (target.name === 'Qoder') generateQoderBootstrap(baseDir, isGlobal, opts);
-  if (target.name === 'Antigravity') generateAntigravityBootstrap(baseDir, isGlobal, opts);
-  if (target.name === 'Aider') generateAiderBootstrap(baseDir, opts);
-  if (target.name === 'Gemini CLI') generateGeminiBootstrap(baseDir, isGlobal, opts);
-  if (target.name === 'Qwen Code') generateQwenBootstrap(baseDir, isGlobal, opts);
-  if (target.name === 'VS Code') generateVSCodeBootstrap(baseDir, opts);
-  if (target.name === 'Claw Code') generateClawBootstrap(baseDir, opts);
-  if (target.name === 'Hermes Agent') generateHermesBootstrap(baseDir, isGlobal, opts);
-  if (target.name === 'Claude Code') generateClaudeCodeBootstrap(baseDir, isGlobal, opts);
-  if (target.name === 'CodeBuddy') generateCodeBuddyBootstrap(baseDir, isGlobal, opts);
-  if (target.name === 'DeepSeek Harness') generateDeepSeekHarnessBootstrap(baseDir, isGlobal, opts);
-  if (target.name === 'Reasonix' && !isGlobal) generateReasonixBootstrap(baseDir, opts);
-  if (target.name === 'Kiro') generateKiroSteeringIndex(baseDir, opts);
-  if (target.name === 'Cline') generateClineBootstrapRule(baseDir, opts);
-  if (target.name === 'Kilo Code') generateKiloCodeBootstrapRule(baseDir, opts);
-
-  if (!opts.noJev) installHooksForTarget(target, baseDir);
 }
 
 function isHomeDir(p) {
@@ -4249,11 +4320,14 @@ ${target.noProjectReason || `        其官方文档只给出用户级技能目�
   const run = createBackupRun(baseDir, isGlobal, 'install');
   let okCount = 0;
   let failCount = 0;
+  let manualRouterCount = 0;
   for (const plan of plans) {
     if (blockedNames.has(plan.target.name)) continue;
     const res = await runTargetTransaction(plan, baseDir, effOpts, run);
-    if (res.ok) okCount++;
-    else failCount++;
+    if (res.ok) {
+      okCount++;
+      manualRouterCount += Array.isArray(res.tx?.manualRouters) ? res.tx.manualRouters.length : 0;
+    } else failCount++;
   }
   run.finalize(); // 全部条目均为新建（无破坏性接管）时连备份目录一起不留
 
@@ -4270,7 +4344,12 @@ ${target.noProjectReason || `        其官方文档只给出用户级技能目�
     console.log(`\n  汇总：${okCount} 个目标完成，${failCount} 个目标失败且已回滚到安装前状态（见 ↩️ 行）；退出码 1。\n`);
     return 1;
   }
-  console.log('\n  安装完成！重启你的 AI 编程工具即可生效。\n');
+  console.log('\n  安装完成！重启你的 AI 编程工具即可生效。');
+  // R-3：unresolvable 不改退出码语义（仍 0），但结局必须在 stdout 汇总可见。
+  if (manualRouterCount > 0) {
+    console.log(`  另有 ${manualRouterCount} 个 router 文件路由未接管、需手工处理（见上方 [路由未接管] 行；技能已安装，文件原样保留）。`);
+  }
+  console.log('');
   return 0;
 }
 
@@ -4341,6 +4420,21 @@ async function main() {
   if (opts.version) {
     console.log(PKG.version);
     return 0;
+  }
+
+  // S-1：--detect-only 承诺「绝不写盘」，必须在任何文件操作前与写操作互斥。
+  // doctor 本身只读，与 --detect-only 同现放行（输出无需预检写动作，保持现状）。
+  if (opts.detectOnly) {
+    if (opts.uninstall) {
+      console.error('  ❌ 参数互斥：--detect-only（只读预检，绝不写盘）不能与 --uninstall/-u（卸载写操作）同时使用。\n'
+        + '     请二选一：只预检用 npx jevzh --detect-only；确认卸载用 npx jevzh --uninstall。\n');
+      return 64;
+    }
+    if (opts.command === 'restore') {
+      console.error('  ❌ 参数互斥：--detect-only（只读预检，绝不写盘）不能与 restore 子命令（恢复必定写盘）同时使用。\n'
+        + '     只读查看备份清单可用：npx jevzh restore --list。\n');
+      return 64;
+    }
   }
 
   // 子命令：doctor（只读诊断）/ restore（离线恢复）。
@@ -4430,6 +4524,9 @@ export {
   redactUrl,
   // 任务 7 审查修复的测试接缝（纯函数/只读探测，无副作用）
   scanAtxHeadings,
+  forEachMarkdownLine,
+  stripCodeBlocks,
+  maskInlineCodeSpans,
   cutForeignMarkedSections,
   verifyBackupPayloads,
   verifyRestoredEntries,

@@ -18,6 +18,10 @@ function fakeHomeEnv(root) {
       USERPROFILE: home,
       APPDATA: path.join(home, 'AppData', 'Roaming'),
       LOCALAPPDATA: path.join(home, 'AppData', 'Local'),
+      // R-1：经接缝注入 npm root -g，绝不在测试里真实 spawn npm——npm 11 即便
+      // exit 0 也会写 %LOCALAPPDATA%/npm-cache/_logs/*-debug-0.log，破坏整树指纹。
+      // 指向不存在的根：共存检测查无 node_modules/superpowers-zh，行为等价干净环境。
+      JEVZH_TEST_NPM_ROOT_G: path.join(root, 'injected-empty-npm-root'),
     },
   };
 }
@@ -91,6 +95,10 @@ test('全局安装幂等：重跑文件集合与内容指纹稳定', () => {
     assert.equal(run(['--global', '--tool', 'claude'], { cwd: root, env }).status, 0);
     assert.deepEqual(listFiles(path.join(root, 'home')), files2);
     assert.equal(hashTree(path.join(root, 'home')), hash2);
+    // R-1：三次运行都不得真实 spawn npm 而在夹具内落 npm 调试日志
+    //（历史红因：%LOCALAPPDATA%/npm-cache/_logs/*-debug-0.log 每次新增）。
+    const logs = listFiles(path.join(root, 'home')).filter((f) => f.includes('npm-cache'));
+    assert.deepEqual(logs, []);
   } finally {
     rmFixture(root);
   }
@@ -127,7 +135,10 @@ test('S-7 Windows：APPDATA/LOCALAPPDATA 重定向到 USERPROFILE 之外时全�
   const home = path.join(root, 'home');
   const roaming = path.join(root, 'redirected', 'Roaming');
   const local = path.join(root, 'redirected', 'Local');
-  const env = { HOME: home, USERPROFILE: home, APPDATA: roaming, LOCALAPPDATA: local };
+  const env = {
+    HOME: home, USERPROFILE: home, APPDATA: roaming, LOCALAPPDATA: local,
+    JEVZH_TEST_NPM_ROOT_G: '',
+  };
   try {
     fs.mkdirSync(home, { recursive: true });
 

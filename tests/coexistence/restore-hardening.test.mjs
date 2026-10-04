@@ -17,7 +17,10 @@ import {
   run, mkFixture, rmFixture, readText,
   listBackups, readBackupManifest,
 } from './helpers.mjs';
-import { makeDirLinkOrSkip, unlinkQuiet } from '../installer/helpers.mjs';
+import { makeDirLinkOrSkip, unlinkQuiet, BIN } from '../installer/helpers.mjs';
+import { pathToFileURL } from 'node:url';
+
+const { verifyRestoredEntries } = await import(pathToFileURL(BIN).href);
 
 const sleep = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
 
@@ -265,4 +268,65 @@ test('R-2c：目标只读致恢复写入 EPERM -> rc1 报 safetyTs/部分恢复�
     try { fs.chmodSync(liveClaude, 0o644); } catch { /* 夹具清理前尽量复位 */ }
     rmFixture(dir);
   }
+});
+
+// R-2d：写后复核（verifyRestoredEntries）真正跑起来且失败时，报告必须带具体
+// relPath 与中文原因，绝不能是 `…复核失败：undefined undefined`。触发方式：
+// 恢复目标（dir 条目）在恢复时是符号链接/junction——写入阶段防穿越【主动跳过】
+// 该条目（写入循环整体成功结束），写后复核 lstat 发现它仍不是正常目录
+//（Windows junction 计入目录但内部文件全缺；POSIX dir 链接 lstat 不是目录），
+// 于是失败。这是「写入成功但复核不符」路径，现有 R-2a/b/c 只覆盖预演中止与
+// 写入异常。Windows 用 junction（无需特权），POSIX 用 dir 型符号链接。
+test('R-2d：恢复目标为 junction/链接被防穿越跳过后写后复核失败 -> rc1 报具体路径而非 undefined，给回退点', (t) => {
+  const ctx = adoptInstallWithDirBackup();
+  const { dir, ts, entry } = ctx;
+  // 注意：ctx.liveSkill 是目录内 SKILL.md 的路径；junction 必须建在【技能目录本
+  // 身】（manifest dir 条目的 abs），写循环的防穿越判定才会命中。
+  const liveSkillDir = path.dirname(ctx.liveSkill);
+  const outside = mkFixture('jevzh-r2h-d-out-');
+  try {
+    // 用空目录做链接目标：junction 存活时复核必然发现 manifest files 全缺。
+    fs.rmSync(liveSkillDir, { recursive: true, force: true }); // Node 只摘 junction 不删目标内容
+    if (!makeDirLinkOrSkip(t, outside, liveSkillDir)) return;
+
+    const r = run(['restore', ts], { cwd: dir });
+    assert.equal(r.status, 1, r.stdout + r.stderr);
+    const out = r.stdout + r.stderr;
+    assert.match(out, /恢复后完整性复核失败/);
+    assert.ok(out.includes(entry.relPath), `输出缺少条目路径 ${entry.relPath}:\n${out}`);
+    assert.match(out, /恢复后目录不完整|恢复后目标不是目录/); // 具体中文原因
+    assert.doesNotMatch(out, /undefined/); // R-2 回归红线：键名必须统一 relPath
+
+    // 给出 pre-restore 回退点（该备份确实已建）。
+    const safetyTs = listBackups(dir)
+      .find((x) => readBackupManifest(dir, x).kind === 'pre-restore');
+    assert.ok(safetyTs, '失败前应已完成 pre-restore 安全网备份');
+    assert.ok(out.includes(`npx jevzh restore ${safetyTs}`), `输出缺少回退命令:\n${out}`);
+
+    // 防穿越：链接本身保留、链接目标未被解引用写入。
+    assert.ok(fs.lstatSync(liveSkillDir).isSymbolicLink(), 'junction/链接应原样保留');
+    assert.deepEqual(fs.readdirSync(outside), [], '链接目标被解引用写入');
+  } finally {
+    unlinkQuiet(liveSkillDir);
+    rmFixture(dir);
+    rmFixture(outside);
+  }
+});
+
+test('R-2d 单元：verifyRestoredEntries 失败对象键名统一为 relPath（不存在的恢复目标）', () => {
+  const failures = verifyRestoredEntries(
+    () => path.join(os.tmpdir(), `jevzh-r2h-unit-nonexistent-${process.pid}-R2D-MISSING-MARKER.txt`),
+    [{
+      existed: true,
+      kind: 'file',
+      relPath: 'R2D-MISSING-MARKER.txt',
+      payload: 'files/0001',
+      sha256: 'a'.repeat(64),
+      size: 1,
+    }],
+  );
+  assert.equal(failures.length, 1);
+  assert.equal(failures[0].relPath, 'R2D-MISSING-MARKER.txt');
+  assert.ok(!Object.prototype.hasOwnProperty.call(failures[0], 'rel'), '残留旧键名 rel');
+  assert.match(failures[0].reason, /恢复后目标不存在/);
 });
