@@ -92,17 +92,21 @@ test('卸载兼容精确清理旧 superpowers-zh 哨兵区块，用户上下文�
 `;
   try {
     fs.writeFileSync(path.join(dir, 'CLAUDE.md'), withLegacy);
-    // 安装：检测到 zh 区块 -> WARN，不追加本包区块
+    // 安装（任务 7）：默认 MIGRATE 接管——备份后切除旧 zh 段、写入本包成对哨兵
     const r1 = run(['--tool', 'claude'], { cwd: dir });
     assert.equal(r1.status, 0, r1.stdout + r1.stderr);
-    assert.match(r1.stdout + r1.stderr, /WARN/);
+    assert.match(r1.stdout + r1.stderr, /MIGRATE/);
     assert.ok(exists(path.join(dir, '.claude', 'skills', 'jev-verification')));
+    const installed = readText(path.join(dir, 'CLAUDE.md'));
+    assert.ok(!installed.includes('<!-- superpowers-zh:begin'), '安装时旧 zh 段应已被接管切除');
+    assert.match(installed, /jev-superpowers-zh:begin/);
 
-    // 卸载：精确切除旧 zh 哨兵段
+    // 卸载：切除本包哨兵段（旧 zh 段安装时已切，且有备份可 restore）
     const r2 = run(['--uninstall', '--tool', 'claude'], { cwd: dir });
     assert.equal(r2.status, 0, r2.stdout + r2.stderr);
     const after = readText(path.join(dir, 'CLAUDE.md'));
     assert.ok(!after.includes('superpowers-zh'), `仍有残留:\n${after}`);
+    assert.ok(!after.includes('jev-superpowers-zh'), `本包哨兵残留:\n${after}`);
     assert.match(after, /区块前的用户内容/);
     assert.match(after, /区块后的用户内容/);
   } finally {

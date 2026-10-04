@@ -53,48 +53,89 @@ description: 用户自己改写过的版本
   }
 });
 
-test('CLAUDE.md 已含 superpowers-zh 哨兵区块：WARN 且整文件不动', () => {
+test('CLAUDE.md 已含 superpowers-zh 哨兵区块：默认 MIGRATE 备份后切除旧段并写入本包哨兵；--keep-router 双份保留', () => {
   const dir = mkFixture('jevzh-coexist-sentinel-');
   const existing = `# 我的项目
 
-用户自有引导内容。
+用户自有引导内容 KEEP-SENTINEL-HEAD。
 
 <!-- superpowers-zh:begin (do not edit between these markers) -->
 # Superpowers-ZH 中文增强版
 
-旧 superpowers-zh 区块内容。
+旧 superpowers-zh 区块内容 ZH-SECTION-BODY。
 <!-- superpowers-zh:end -->
 
-结尾的用户内容。
+结尾的用户内容 KEEP-SENTINEL-TAIL。
 `;
   try {
     fs.writeFileSync(path.join(dir, 'CLAUDE.md'), existing);
     const r = run(['--tool', 'claude'], { cwd: dir });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     const out = r.stdout + r.stderr;
-    assert.match(out, /WARN/);
-    // 文件字节级保持（归一化 CRLF 后逐字相等）
-    assert.equal(readText(path.join(dir, 'CLAUDE.md')), existing.replace(/\r?\n/g, '\n'));
-    assert.ok(!readText(path.join(dir, 'CLAUDE.md')).includes('jev-superpowers-zh:begin'));
+    // 任务 7：默认从「WARN 不动」升级为「备份后精确接管（MIGRATE）」
+    assert.match(out, /MIGRATE/);
+    const after = readText(path.join(dir, 'CLAUDE.md'));
+    assert.ok(!after.includes('<!-- superpowers-zh:begin'), '旧 zh 哨兵应切除');
+    assert.ok(!after.includes('ZH-SECTION-BODY'), '旧段正文应切除');
+    assert.match(after, /<!-- jev-superpowers-zh:begin/);
+    assert.match(after, /<!-- jev-superpowers-zh:end/);
+    assert.equal((after.match(/jev-superpowers-zh:begin/g) ?? []).length, 1);
+    assert.match(after, /KEEP-SENTINEL-HEAD/);
+    assert.match(after, /KEEP-SENTINEL-TAIL/);
+    // 接管属于破坏性操作，必须留下备份
+    const bkRoot = path.join(dir, '.jevzh', 'backups');
+    assert.ok(exists(bkRoot) && fs.readdirSync(bkRoot).length >= 1, 'MIGRATE 应产生备份');
+
+    // --keep-router：共享 bootstrap 整文件保留（旧段不切、本包段也不追加）
+    const dir2 = mkFixture('jevzh-coexist-sentinel-keep-');
+    try {
+      fs.writeFileSync(path.join(dir2, 'CLAUDE.md'), existing);
+      const rk = run(['--tool', 'claude', '--keep-router'], { cwd: dir2 });
+      assert.equal(rk.status, 0, rk.stdout + rk.stderr);
+      assert.match(rk.stdout + rk.stderr, /WARN/);
+      const kept = readText(path.join(dir2, 'CLAUDE.md'));
+      assert.equal(kept, existing.replace(/\r?\n/g, '\n'), '--keep-router 应字节级不动');
+      assert.match(kept, /<!-- superpowers-zh:begin/, '--keep-router 应保留旧 zh 哨兵');
+      assert.match(kept, /ZH-SECTION-BODY/, '--keep-router 应保留旧段正文');
+      assert.ok(!kept.includes('jev-superpowers-zh:begin'), '--keep-router 不追加本包段');
+    } finally {
+      rmFixture(dir2);
+    }
   } finally {
     rmFixture(dir);
   }
 });
 
-test('Trae 已装 zh 独立规则文件：jevzh 写自己的文件，WARN 且不动 zh 文件', () => {
+test('Trae 已装 zh 独立规则文件：默认备份后移除旧文件并写 jevzh.md；--keep-router 双份保留', () => {
   const dir = mkFixture('jevzh-coexist-rule-');
   try {
     const zhRuleDir = path.join(dir, '.trae', 'rules');
     fs.mkdirSync(zhRuleDir, { recursive: true });
     fs.writeFileSync(path.join(zhRuleDir, 'superpowers-zh.md'), '# ZH-RULE-MARKER\n');
-    fs.mkdirSync(path.join(dir, '.trae'), { recursive: true });
 
     const r = run(['--tool', 'trae'], { cwd: dir });
     assert.equal(r.status, 0, r.stdout + r.stderr);
     const out = r.stdout + r.stderr;
-    assert.match(out, /WARN/);
-    assert.equal(readText(path.join(zhRuleDir, 'superpowers-zh.md')), '# ZH-RULE-MARKER\n');
+    assert.match(out, /MIGRATE/);
+    assert.ok(!exists(path.join(zhRuleDir, 'superpowers-zh.md')), '旧规则文件应已备份后移除');
     assert.ok(exists(path.join(zhRuleDir, 'jevzh.md')));
+    const bkRoot2 = path.join(dir, '.jevzh', 'backups');
+    assert.ok(exists(bkRoot2) && fs.readdirSync(bkRoot2).length >= 1, '移除旧规则文件应产生备份');
+
+    // --keep-router 分支：旧文件保留不动，本包文件并存
+    const dir2 = mkFixture('jevzh-coexist-rule-keep-');
+    try {
+      const zhRuleDir2 = path.join(dir2, '.trae', 'rules');
+      fs.mkdirSync(zhRuleDir2, { recursive: true });
+      fs.writeFileSync(path.join(zhRuleDir2, 'superpowers-zh.md'), '# ZH-RULE-MARKER\n');
+      const rk = run(['--tool', 'trae', '--keep-router'], { cwd: dir2 });
+      assert.equal(rk.status, 0, rk.stdout + rk.stderr);
+      assert.match(rk.stdout + rk.stderr, /WARN/);
+      assert.equal(readText(path.join(zhRuleDir2, 'superpowers-zh.md')), '# ZH-RULE-MARKER\n');
+      assert.ok(exists(path.join(zhRuleDir2, 'jevzh.md')));
+    } finally {
+      rmFixture(dir2);
+    }
   } finally {
     rmFixture(dir);
   }

@@ -25,7 +25,7 @@ import {
   existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync,
   copyFileSync, lstatSync, realpathSync, rmSync, chmodSync, renameSync,
 } from 'node:fs';
-import { resolve, dirname, join, sep, basename } from 'node:path';
+import { resolve, dirname, join, sep, basename, isAbsolute } from 'node:path';
 import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
@@ -195,6 +195,34 @@ function globalRelDir(target) {
   return g.dir;
 }
 
+// S-7：全局 dirWin 目标（Reasonix/Crush）的技能根在 APPDATA/LOCALAPPDATA 被重定向到
+// home 之外时，事务/护栏根必须切到该目标自己的文件根（dirWin 技能根的上一级，例如
+// %APPDATA%/reasonix）；未重定向（仍在 home 下）或非 dirWin 目标则仍用 home。
+function globalTargetFileBase(target, isGlobal, baseDir) {
+  if (!isGlobal) return baseDir;
+  const gAbs = globalRelDir(target);
+  if (gAbs && isAbsolute(gAbs) && !isInsideDir(baseDir, gAbs)) return resolve(gAbs, '..');
+  return baseDir;
+}
+
+// restore：按 manifest 条目所属 target 把 relPath 解析回当前环境的绝对路径。
+// 重定向环境产生的备份（rel 形如 skills/brainstorming/...）落在 dirWin 文件根；
+// 普通条目仍相对 home/baseDir。
+function restoreEntryAbs(baseDir, targetName, rel) {
+  const homeAbs = resolve(baseDir, rel);
+  if (isInsideDir(baseDir, homeAbs)) return homeAbs;
+  const t = TARGETS.find(x => x.name === targetName);
+  if (t && t.global && process.platform === 'win32' && t.global.dirWin) {
+    const gAbs = globalRelDir(t);
+    if (gAbs && isAbsolute(gAbs)) {
+      const root = resolve(gAbs, '..');
+      const cand = resolve(root, rel);
+      if (isInsideDir(root, cand)) return cand;
+    }
+  }
+  return homeAbs;
+}
+
 function countDirs(dir) {
   if (!existsSync(dir)) return 0;
   return readdirSync(dir, { withFileTypes: true }).filter(e => e.isDirectory()).length;
@@ -298,38 +326,46 @@ function skillCount(noJev) {
   return selectedSkillNames(noJev).length;
 }
 
-// 往用户共享文件追加本包哨兵区块：已有本包区块则幂等跳过；检测到竞品区块则
-// WARN 且完全不动文件（任务 7 再做备份后接管）。
+// 往用户共享文件追加本包哨兵区块（事务感知）：
+//   - 已有同 target 本包区块 -> 幂等跳过；
+//   - 竞品旧段 -> 默认备份整文件后精确切除并写入本包成对哨兵（MIGRATE）；
+//     --keep-router 时保留不动（WARN）；
+//   - 悬空 begin（无配对 end）-> WARN，不接管不追加；
+//   - 多 target 共享文件（S-9）：顺序追加带 target 属性的成对区块。
+// 无活动事务时（不应出现的直调路径）退回任务 6 的保守「WARN 不动」行为。
 function appendSentinelSection(filePath, content, label) {
+  if (ACTIVE_TX) {
+    ACTIVE_TX.appendShared(filePath, content, label);
+    return;
+  }
   mkdirSync(dirname(filePath), { recursive: true });
   if (existsSync(filePath)) {
     const existing = readFileSync(filePath, 'utf8');
-    if (existing.includes(SENTINEL_BEGIN)) {
+    if (existing.match(OUR_BEGIN_RE)) {
       console.log(`  ✅ ${label}: 已包含 jevzh 引导区块，跳过 -> ${filePath}`);
       return;
     }
     if (containsCompetitorSection(existing)) {
-      console.warn(`  ⚠️ WARN ${label}: ${filePath} 已含其他发行版（superpowers-zh / jev）的引导区块，`
-        + `本次保留不动（同名路由仅允许一个生效；任务 7 将支持备份后接管迁移）。`);
+      console.warn(`  ⚠️ WARN ${label}: ${filePath} 已含其他发行版（superpowers-zh / jev）的引导区块，本次保留不动。`);
       return;
     }
     atomicWriteFileSync(filePath, existing.replace(/\s+$/, '') + '\n\n' + wrapWithSentinel(content));
-    console.log(`  ✅ ${label}: 追加 skills 引用 -> ${filePath}`);
   } else {
     atomicWriteFileSync(filePath, wrapWithSentinel(content));
-    console.log(`  ✅ ${label}: bootstrap -> ${filePath}`);
   }
 }
 
 // 独立规则文件（文件名带 jevzh 品牌，天然不与旧 zh 文件冲突）。
-// 检测到旧 superpowers-zh 同名机制文件时只 WARN 不动。
+// 默认备份后移除旧 superpowers-zh 同名机制文件（MIGRATE）；--keep-router 保留双份。
 function writeStandaloneRule(filePath, content, label, legacyZhPath) {
+  if (ACTIVE_TX) {
+    ACTIVE_TX.writeStandalone(filePath, content, label, legacyZhPath);
+    return;
+  }
   mkdirSync(dirname(filePath), { recursive: true });
   atomicWriteFileSync(filePath, content);
-  console.log(`  ✅ ${label}: bootstrap rule -> ${filePath}`);
   if (legacyZhPath && existsSync(legacyZhPath)) {
-    console.warn(`  ⚠️ WARN ${label}: 检测到旧 superpowers-zh 规则文件 ${legacyZhPath}，已保留不动；`
-      + `两份常驻规则可能同时生效，任务 7 将支持备份后接管。`);
+    console.warn(`  ⚠️ WARN ${label}: 检测到旧 superpowers-zh 规则文件 ${legacyZhPath}，已保留不动。`);
   }
 }
 
@@ -838,8 +874,9 @@ function isSymlinkPath(p) {
 // 不同的文件视为用户/他方内容，WARN 且不动。
 // 返回 { installed, linkSkipped }：linkSkipped=true 表示容器本身是链接被整目录
 // 跳过（调用方不得再当成功打印 ✅）。
-function installOwnedFiles(srcDir, destDir, fileNames, label) {
-  mkdirSync(destDir, { recursive: true });
+function installOwnedFiles(srcDir, destDir, fileNames, label, onAdded = null) {
+  if (ACTIVE_TX) ACTIVE_TX.ensureDir(destDir);
+  else mkdirSync(destDir, { recursive: true });
   // 容器本身是链接（含 Windows junction）：写入会落到链接目标（可能在项目/家目录
   // 之外）——整目录跳过防穿越。
   if (isSymlinkPath(destDir)) {
@@ -861,42 +898,19 @@ function installOwnedFiles(srcDir, destDir, fileNames, label) {
         continue;
       }
       if (filesEqual(src, dst)) continue;
-      console.warn(`  ⚠️ WARN ${label}: ${dst} 已存在且内容与本包不同，保留不动（任务 7 将做读改写合并）。`);
+      console.warn(`  ⚠️ WARN ${label}: ${dst} 已存在且内容与本包不同，保留不动（零覆盖非本管文件）。`);
       continue;
     }
     let stat;
     try { stat = lstatSync(src); } catch { continue; }
     copyFileWithMode(src, dst, stat);
+    if (typeof onAdded === 'function') onAdded(dst);
     installed++;
   }
   return { installed, linkSkipped: false };
 }
 
-function installHooksForTarget(target, baseDir) {
-  if (!target.hooks) return;
-  const hookDest = resolve(baseDir, target.hooks);
-  const scriptDest = resolve(baseDir, dirname(target.hooks), 'scripts');
-  const hooks = installOwnedFiles(HOOKS_SRC, hookDest, HOOK_FILES, `${target.name} hooks`);
-  const scripts = installOwnedFiles(SCRIPTS_SRC, scriptDest, GATE_SCRIPT_FILES, `${target.name} scripts`);
-  // R3：hooks 容器本身是链接、已被整目录跳过时，绝不能再凭 existsSync(hookDest)
-  // 为真打 ✅ 成功行（链接路径本来就 exists）——那会与上面的 WARN 自相矛盾。
-  if (hooks.linkSkipped) {
-    console.warn(`  ⚠️ SKIP ${target.name}: 跳过 hooks 运行时（目标目录是符号链接/junction）-> ${hookDest}`
-      + '（未写入任何 hooks 文件，链接目标未触及）。');
-    if (scripts.installed > 0) {
-      console.log(`  ✅ ${target.name}: 门禁脚本 -> ${scriptDest}（与 hooks 容器相互独立，已正常落位）`);
-    }
-    return;
-  }
-  if (hooks.installed > 0 || existsSync(hookDest)) {
-    console.log(`  ✅ ${target.name}: hooks 运行时 -> ${hookDest}`);
-    console.log(`     门禁脚本 -> ${scriptDest}（session-start/pre-commit/stop 经 run-hook.cmd 调用）`);
-    console.log('     ℹ️  settings 自动接线（读改写合并）将在后续版本完成；当前先落运行时文件。');
-    if (process.platform === 'win32') {
-      console.log('     ℹ️  Windows 不跟踪可执行位：钩子统一由 run-hook.cmd 调 Git for Windows bash，无需 chmod +x。');
-    }
-  }
-}
+// installHooksForTarget 的任务 7 事务化版本见文件后部（R-1 宿主过滤 + 事务跟踪）。
 
 // ---------------------------------------------------------------------------
 // .jevzh.json：项目根配置，首次生成，已存在绝不覆盖。字段契约与
@@ -967,7 +981,256 @@ function writeSkillMeta(destSkillDir, target, isGlobal) {
   atomicWriteFileSync(resolve(destSkillDir, '.jevzh-meta.json'), JSON.stringify(meta, null, 2) + '\n');
 }
 
-function installSkillsForTarget(target, baseDir, isGlobal, opts) {
+// ===========================================================================
+// 任务 7：共存预检（五级处置）、四来源识别、按目标事务、备份/轮转、
+// doctor / restore、hooks settings 读改写合并。零第三方依赖。
+// ===========================================================================
+
+// --- 哨兵：本包 begin 支持 target="..." 归属属性（S-9 多目标共享文件区块共存）---
+const OUR_BEGIN_PREFIX = '<!-- jev-superpowers-zh:begin (do not edit between these markers)';
+const OUR_BEGIN_RE = /<!--\s*jev-superpowers-zh:begin\b[^>]*?-->/g;
+
+function ourBeginMarker(targetName) {
+  return targetName ? `${OUR_BEGIN_PREFIX} target="${targetName}" -->` : SENTINEL_BEGIN;
+}
+
+function wrapWithSentinelTarget(body, targetName) {
+  return `${ourBeginMarker(targetName)}\n${String(body).replace(/\n+$/, '')}\n${SENTINEL_END}\n`;
+}
+
+function markerTargetName(markerText) {
+  const m = /target="([^"]*)"/.exec(markerText);
+  return m ? m[1] : null;
+}
+
+function countOccurrences(haystack, needle) {
+  if (!needle) return 0;
+  let n = 0;
+  let i = haystack.indexOf(needle);
+  while (i !== -1) { n++; i = haystack.indexOf(needle, i + needle.length); }
+  return n;
+}
+
+// 成对哨兵切除（支持字符串或正则 begin、按 target 归属过滤）。
+// 区间内再出现同目标 begin（嵌套/双 begin 单 end）-> malformed，整文件保留。
+function cutPairedSections(content, beginLike, end, options = {}) {
+  const onlyTarget = options.onlyTarget || null;
+  // 单目标模式下，是否允许同时切除「无 target 属性的旧 begin」：
+  // 仅当文件中不存在其他 target 的区块时为 true（旧 begin 是多 target 化之前的遗物，
+  // 例如 CLAUDE.md 只可能属于 Claude）；S-9 那种多 target 共存文件不适用。
+  const cutUntargeted = !!onlyTarget && !!options.cutUntargeted;
+  const findBegin = (s, from) => {
+    if (typeof beginLike === 'string') {
+      const i = s.indexOf(beginLike, from);
+      return i === -1 ? null : { index: i, text: beginLike };
+    }
+    const flags = (beginLike.flags || '').replace('g', '') + 'g';
+    const re = new RegExp(beginLike.source, flags);
+    re.lastIndex = from;
+    const m = re.exec(s);
+    return m ? { index: m.index, text: m[0] } : null;
+  };
+
+  let text = content;
+  let cut = false;
+  for (;;) {
+    let cursor = 0;
+    let b = null;
+    for (;;) {
+      const cand = findBegin(text, cursor);
+      if (!cand) break;
+      if (onlyTarget) {
+        const tn = markerTargetName(cand.text);
+        const matches = tn === onlyTarget || (cutUntargeted && tn === null);
+        if (!matches) {
+          cursor = cand.index + cand.text.length;
+          continue;
+        }
+      }
+      b = cand;
+      break;
+    }
+    if (!b) break;
+    const j = text.indexOf(end, b.index + b.text.length);
+    if (j === -1) break;
+    const inner = findBegin(text, b.index + b.text.length);
+    if (inner && inner.index < j) {
+      // 任何 begin 出现在当前 begin..end 之间都是嵌套/交叉（正常多区块必然顺序成对，
+      // 无论同 target、其他 target 还是无属性旧 begin），一律畸形整文件保留。
+      return { text: content, cut: false, malformed: true };
+    }
+    text = text.slice(0, b.index) + text.slice(j + end.length);
+    cut = true;
+  }
+  return { text, cut, malformed: false };
+}
+
+// --- 四来源识别（ours / zh / jev / obra / unknown / empty）---
+const CJK_RE = /[\u3400-\u9fff\uf900-\ufaff]/;
+const FORK_MARK = '本节是 superpowers-zh 的增量内容';
+const JEV_EN_FEATURES = ['TypeSafe Jev', 'Failure Modes', 'docs/CONFIDENCE.md'];
+
+function readSkillBody(skillDir) {
+  try {
+    return readFileSync(resolve(skillDir, 'SKILL.md'), 'utf8');
+  } catch {
+    return null;
+  }
+}
+
+function readSkillMeta(skillDir) {
+  try {
+    const m = JSON.parse(readFileSync(resolve(skillDir, '.jevzh-meta.json'), 'utf8'));
+    return m && typeof m === 'object' ? m : null;
+  } catch {
+    return undefined; // undefined = 无/坏 meta；null = 有但非法
+  }
+}
+
+// 正文分类（不含 meta 判断）。
+function classifySkillText(text) {
+  if (text == null) return null;
+  // 1) 本包显式增量标记（本包 jev 技能均带此句）。
+  if (text.includes('本节是 jev-superpowers-zh 的增量内容')) return 'ours';
+  // 2) 英文 jev：TypeSafe 三特征且全文无 CJK 汉字——必须排在裸品牌串之前，
+  //    因为英文 jev 文档可能在描述中提及 "jev-superpowers-zh"（不等于归属）。
+  const hasJevFeature = JEV_EN_FEATURES.some(f => text.includes(f));
+  if (hasJevFeature && !CJK_RE.test(text)) return 'jev';
+  // 3) 本包品牌串（meta 之外的兜底品牌证据；走到这里的英文三特征文本已在 2 拦截）。
+  if (text.includes(PKG.name)) return 'ours';
+  // 4) 同源中文版：FORK_MARK / 旧哨兵 / superpowers-zh 品牌
+  //    （词边界：不得把 jev-superpowers-zh 误算成旧中文版）。
+  if (text.includes(FORK_MARK) || /(?<!jev-)superpowers-zh/.test(text)) return 'zh';
+  // 5) obra：superpowers:<slug> 调用前缀
+  if (/superpowers:[a-z]/i.test(text)) return 'obra';
+  return null;
+}
+
+// 技能目录分类。返回 {source, version?, reason}。
+// 入参既可能是目录路径（字符串），也可能是技能正文字符串：以「路径是否存在」区分——
+// 存在则按目录（读 meta + SKILL.md），否则把字符串本身当正文分类。
+function classifySkillSource(skillDirOrText) {
+  let skillDir = null;
+  if (typeof skillDirOrText === 'string') {
+    try {
+      if (existsSync(skillDirOrText)) skillDir = skillDirOrText;
+    } catch { skillDir = null; }
+    if (!skillDir) return { source: classifySkillText(skillDirOrText) || 'unknown' };
+  } else {
+    skillDir = skillDirOrText;
+  }
+  const meta = readSkillMeta(skillDir);
+  if (meta && meta.pkg === PKG.name) return { source: 'ours', version: meta.version };
+  if (meta && typeof meta.pkg === 'string' && meta.pkg) {
+    // 有合法 meta 但 pkg 不匹配：不得被正文特征漂白
+    return { source: 'unknown', reason: `meta.pkg=${meta.pkg}` };
+  }
+  const body = readSkillBody(skillDir);
+  if (body == null || body.trim() === '') return { source: 'empty' };
+  const byText = classifySkillText(body);
+  if (byText === 'ours') return { source: 'ours' };
+  if (byText) return { source: byText };
+  return { source: 'unknown' };
+}
+
+function compareVersions(a, b) {
+  const pa = String(a || '0.0.0').split('.').map(n => Number.parseInt(n, 10) || 0);
+  const pb = String(b || '0.0.0').split('.').map(n => Number.parseInt(n, 10) || 0);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) return d;
+  }
+  return 0;
+}
+
+// --- 竞品插件启用记录检测（精确词边界，本包 jev-superpowers-zh 不得误判）---
+const PLUGIN_COMPETITOR_PATTERNS = [
+  { label: 'superpowers-zh', re: /(^|[^A-Za-z0-9-])superpowers-zh(?=$|[^A-Za-z0-9-])/i },
+  { label: 'jev-superpowers（英文 jev 插件）', re: /(^|[^A-Za-z0-9-])jev-superpowers(?=$|[^A-Za-z0-9-])/i },
+  { label: 'superpowers（obra 原版插件）', re: /(^|[^A-Za-z0-9-])superpowers(?=$|[^A-Za-z0-9-])/i },
+];
+
+function scanPluginCompetitors(baseDir, target) {
+  const pluginDirs = target.name === 'Cursor' ? ['.cursor-plugin'] : ['.claude-plugin'];
+  const hits = [];
+  for (const d of pluginDirs) {
+    const dir = resolve(baseDir, d);
+    let ents;
+    try { ents = readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const ent of ents) {
+      if (!ent.isFile() || !/\.json$/i.test(ent.name)) continue;
+      let raw;
+      try { raw = readFileSync(resolve(dir, ent.name), 'utf8'); } catch { continue; }
+      for (const p of PLUGIN_COMPETITOR_PATTERNS) {
+        if (p.re.test(raw) && !hits.some(h => h.file === `${d}/${ent.name}` && h.name === p.label)) {
+          hits.push({ file: `${d}/${ent.name}`, name: p.label });
+        }
+      }
+    }
+  }
+  return hits;
+}
+
+// --- 每个 target 的 router 描述符（与各 bootstrap 生成器路径严格一致）---
+const ROUTER_DESCRIPTORS = {
+  project: {
+    'Claude Code': { shared: ['CLAUDE.md'] },
+    'Gemini CLI': { shared: ['GEMINI.md'] },
+    'Qwen Code': { shared: ['QWEN.md'] },
+    'Claw Code': { shared: ['CLAW.md'] },
+    'Aider': { shared: ['CONVENTIONS.md'] },
+    'CodeBuddy': { shared: ['CODEBUDDY.md'] },
+    'Hermes Agent': { shared: ['AGENTS.md'] },
+    'DeepSeek Harness': { shared: ['AGENTS.md'] },
+    'Antigravity': { shared: ['.agents/rules.md'] },
+    'Reasonix': { shared: ['REASONIX.md'] },
+    'Trae': { standalone: [{ oursRel: '.trae/rules/jevzh.md', legacyRel: '.trae/rules/superpowers-zh.md' }] },
+    'Cline': { standalone: [{ oursRel: '.clinerules/jevzh.md', legacyRel: '.clinerules/superpowers-zh.md' }] },
+    'Kilo Code': { standalone: [{ oursRel: '.kilocode/rules/jevzh.md', legacyRel: '.kilocode/rules/superpowers-zh.md' }] },
+    'Kiro': { standalone: [{ oursRel: '.kiro/steering/jevzh.md', legacyRel: '.kiro/steering/superpowers-zh.md' }] },
+    'Qoder': { standalone: [{ oursRel: '.qoder/rules/jevzh.md', legacyRel: '.qoder/rules/superpowers-zh.md' }] },
+    'VS Code': { standalone: [{ oursRel: '.github/instructions/jevzh.instructions.md', legacyRel: '.github/instructions/superpowers-zh.instructions.md' }] },
+  },
+  global: {
+    'Claude Code': { shared: ['.claude/CLAUDE.md'] },
+    'Gemini CLI': { shared: ['.gemini/GEMINI.md'] },
+    'Qwen Code': { shared: ['.qwen/QWEN.md'] },
+    'CodeBuddy': { shared: ['.codebuddy/CODEBUDDY.md'] },
+    'DeepSeek Harness': { shared: ['.dsh/AGENTS.md'] },
+    'Qoder': { standalone: [{ oursRel: '.qoder/rules/jevzh.md', legacyRel: '.qoder/rules/superpowers-zh.md' }] },
+  },
+};
+
+function routerDescriptor(target, isGlobal) {
+  return (ROUTER_DESCRIPTORS[isGlobal ? 'global' : 'project'] || {})[target.name] || null;
+}
+
+// router 正文状态分析（悬空/本包区块/竞品痕迹）。
+function analyzeRouterText(text) {
+  const oursMarkers = [...text.matchAll(new RegExp(OUR_BEGIN_RE.source, 'g'))].map(m => m[0]);
+  const oursBegin = oursMarkers.length;
+  const oursEnd = countOccurrences(text, SENTINEL_END);
+  const zhBegin = countOccurrences(text, ZH_SENTINEL_BEGIN);
+  const zhEnd = countOccurrences(text, ZH_SENTINEL_END);
+  // 竞品判定必须先剔除本包成对区块：区块内的技能表天然含有
+  // jev-using-superpowers / TypeSafe Jev 等字样，不能据此判自己为竞品
+  // （否则 S-9 多 target 共享文件时第二个 target 会被误挡、无法追加区块）。
+  const stripped = cutPairedSections(text, OUR_BEGIN_RE, SENTINEL_END).text;
+  return {
+    oursBegin,
+    oursEnd,
+    danglingOurs: oursBegin !== oursEnd,
+    zhBegin,
+    zhEnd,
+    danglingZh: zhBegin !== zhEnd,
+    oursTargets: oursMarkers.map(markerTargetName),
+    hasCompetitor: containsCompetitorSection(stripped)
+      || /superpowers:[a-z]/i.test(stripped)
+      || (stripped.includes('TypeSafe Jev') && !CJK_RE.test(stripped)),
+  };
+}
+
+function installSkillsForTarget(target, baseDir, isGlobal, opts, plan = null, run = null) {
   const relDir = isGlobal ? globalRelDir(target) : target.dir;
   const dest = resolve(baseDir, relDir);
   const names = selectedSkillNames(opts.noJev);
@@ -992,7 +1255,8 @@ function installSkillsForTarget(target, baseDir, isGlobal, opts) {
     }
   }
 
-  mkdirSync(dest, { recursive: true });
+  if (ACTIVE_TX) ACTIVE_TX.ensureDir(dest);
+  else mkdirSync(dest, { recursive: true });
 
   // I-1：技能容器本身是符号链接/junction（Windows npx 缓存、用户手工 junction 都可能
   // 命中），继续写入会落到链接目标、穿越到项目/家目录之外。整个 target 判失败，不写任何文件。
@@ -1003,12 +1267,21 @@ function installSkillsForTarget(target, baseDir, isGlobal, opts) {
     throw new Error(msg);
   }
 
+  // 预检动作表（任务 7 事务化安装）：未提供 plan 时沿用旧的就地判定（向后兼容）。
+  const actionByName = new Map();
+  if (plan) {
+    for (const s of plan.skills) actionByName.set(s.name, s);
+  }
+
   let added = 0;
   let already = 0;
   let warned = 0;
+  let upgraded = 0;
   for (const name of names) {
     const src = resolve(SKILLS_SRC, name);
     const dst = resolve(dest, name);
+    const planned = actionByName.get(name);
+    const rel = relFromBase(baseDir, dst);
     // 先 lstat（不跟随）：技能子目录是链接时绝不能穿透复制/写 meta，也不能穿透读 meta。
     let dstStat;
     try { dstStat = lstatSync(dst); } catch { dstStat = null; }
@@ -1019,26 +1292,47 @@ function installSkillsForTarget(target, baseDir, isGlobal, opts) {
         warned++;
         continue;
       }
-      if (isOurManaged(dst)) {
+      if (planned && planned.action === 'skip') {
+        warned++;
+        continue;
+      }
+      if (planned && planned.action === 'skip-ours') {
         already++;
-      } else if (isDirEmpty(dst)) {
-        // R2：目录存在但完全为空（无 SKILL.md、无 meta）——典型是上次安装中途
-        // 失败（权限/杀软/磁盘）留下的空壳。旧逻辑把它永久判为「非本包管理」，
-        // 之后再也不会补缺；空目录里没有任何用户内容可损失，安全接管：正常复制
-        // 技能内容并写 meta。非空但无 meta 的用户目录仍走下方 WARN，维持不动。
-        console.log(`  ℹ️  接管空目录 ${dst}（目录存在但完全为空，疑似上次安装失败的残留）：补齐技能内容并写入本包 meta。`);
+        continue;
+      }
+      if (planned && (planned.action === 'upgrade' || planned.action === 'adopt')) {
+        // 本包旧版自升级 / --adopt-skills 接管：先备份整目录再覆盖（事务可回滚）。
+        if (ACTIVE_TX && run) ACTIVE_TX.backupAndReplaceDir(dst, rel);
+        else rmSync(dst, { recursive: true, force: true });
         copyDirSync(src, dst);
         writeSkillMeta(dst, target, isGlobal);
-        added++;
-      } else {
-        console.warn(`  ⚠️ WARN 同名技能 ${name} 已存在于 ${dst} 且非本包管理（无本包 .jevzh-meta.json），`
-          + '判定为用户/他方内容，保留不动（零覆盖；任务 7 将提供 --adopt-skills 接管）。');
-        warned++;
+        upgraded++;
+        continue;
       }
+      if (isOurManaged(dst)) {
+        already++;
+        continue;
+      }
+      if (isDirEmpty(dst)) {
+        // R2：目录存在但完全为空（无 SKILL.md、无 meta）——典型是上次安装中途
+        // 失败（权限/杀软/磁盘）留下的空壳。空目录里没有任何用户内容可损失，
+        // 安全接管：补齐技能内容并写本包 meta。
+        console.log(`  ℹ️  接管空目录 ${dst}（目录存在但完全为空，疑似上次安装失败的残留）：补齐技能内容并写本包 meta。`);
+        if (ACTIVE_TX) ACTIVE_TX.noteExistingEmptyDir(rel);
+        copyDirSync(src, dst);
+        writeSkillMeta(dst, target, isGlobal);
+        if (ACTIVE_TX) ACTIVE_TX.trackCreatedDir(dst, rel, { wasEmpty: true });
+        added++;
+        continue;
+      }
+      console.warn(`  ⚠️ WARN 同名技能 ${name} 已存在于 ${dst} 且非本包管理（无本包 .jevzh-meta.json），`
+        + '判定为用户/他方内容，保留不动（零覆盖；确认可替换请用 --adopt-skills 接管）。');
+      warned++;
       continue;
     }
     copyDirSync(src, dst);
     writeSkillMeta(dst, target, isGlobal);
+    if (ACTIVE_TX) ACTIVE_TX.trackCreatedDir(dst, rel, { wasEmpty: false });
     added++;
   }
 
@@ -1054,9 +1348,1406 @@ function installSkillsForTarget(target, baseDir, isGlobal, opts) {
   }
 
   const scopeTag = isGlobal ? '[全局]' : '[项目]';
-  console.log(`  ✅ ${target.name} ${scopeTag}: 新装 ${added} 个 / 已装 ${already} 个 skills -> ${dest}`
-    + (warned ? `（${warned} 个同名他方技能跳过，见 WARN）` : ''));
-  return { added, already, warned };
+  console.log(`  ✅ ${target.name} ${scopeTag}: 新装 ${added} 个 / 已装 ${already} 个`
+    + `${upgraded ? ` / 升级接管 ${upgraded} 个` : ''} skills -> ${dest}`
+    + (warned ? `（${warned} 个同名他方技能跳过，见 SKIP/WARN）` : ''));
+  return { added, already, warned, upgraded };
+}
+
+// --- 路径护栏：任何事务/恢复操作都必须落在 baseDir 之内 ---
+function relFromBase(baseDir, abs) {
+  const b = resolve(baseDir);
+  const p = resolve(abs);
+  if (p === b) return '';
+  if (!p.startsWith(b + sep)) throw new Error(`路径越界护栏：${p} 不在 ${b} 之内`);
+  return p.slice(b.length + 1).split(sep).join('/');
+}
+
+function isInsideDir(baseDir, abs) {
+  const b = resolve(baseDir);
+  const p = resolve(abs);
+  return p === b || p.startsWith(b + sep);
+}
+
+// 有边界的英文 jev / obra 旧段切除（保守）：ATX 标题 + 段内至少 2 个高置信特征。
+// 边界不可判定 -> unresolvable，调用方 WARN 整文件保留。
+const FOREIGN_SECTION_FEATURES = [
+  'TypeSafe Jev', 'Failure Modes', 'jev-using-superpowers',
+  'docs/CONFIDENCE.md', 'superpowers:using-superpowers', 'jev-superpowers',
+];
+function cutForeignMarkedSections(content) {
+  if (!FOREIGN_SECTION_FEATURES.some(f => content.includes(f))) return { text: content, cut: false, unresolvable: false };
+  const headRe = /^[ \t]{0,3}(#{1,3})[ \t]+(.+?)[ \t#]*\r?$/gm;
+  const heads = [...content.matchAll(headRe)]
+    .filter(m => /superpowers|typesafe\s*jev/i.test(m[2]))
+    .map(m => ({ index: m.index, level: m[1].length }));
+  if (heads.length === 0) return { text: content, cut: false, unresolvable: true };
+  let text = content;
+  let cut = false;
+  // 从后往前切，下标不失效
+  for (let i = heads.length - 1; i >= 0; i--) {
+    const start = heads[i].index;
+    let end = text.length;
+    for (let j = i + 1; j < heads.length; j++) {
+      if (heads[j].level <= heads[i].level) { end = heads[j].index; break; }
+    }
+    const section = text.slice(start, end);
+    const hits = FOREIGN_SECTION_FEATURES.filter(f => section.includes(f)).length;
+    if (hits < 2) return { text: content, cut: false, unresolvable: true };
+    text = text.slice(0, start) + text.slice(end);
+    cut = true;
+  }
+  return { text, cut, unresolvable: false };
+}
+
+// --- hooks 运行时（R-1：按宿主过滤；Claude 不落 hooks-cursor.json，反之亦然）---
+function hookRuntimeFiles(target) {
+  if (target.name === 'Claude Code') return HOOK_FILES.filter(f => f !== 'hooks-cursor.json');
+  if (target.name === 'Cursor') {
+    return ['hooks-cursor.json', 'session-start', 'pre-commit', 'stop', 'run-hook.cmd'];
+  }
+  return [];
+}
+
+function installHooksForTarget(target, baseDir, tx = null) {
+  if (!target.hooks) return;
+  const hookDest = resolve(baseDir, target.hooks);
+  const scriptDest = resolve(baseDir, dirname(target.hooks), 'scripts');
+  const onHookAdded = tx ? (dst) => tx.trackCreatedFile(dst) : null;
+  const hooks = installOwnedFiles(
+    HOOKS_SRC, hookDest, hookRuntimeFiles(target), `${target.name} hooks`, onHookAdded,
+  );
+  const onScriptAdded = tx ? (dst) => tx.trackCreatedFile(dst) : null;
+  const scripts = installOwnedFiles(
+    SCRIPTS_SRC, scriptDest, GATE_SCRIPT_FILES, `${target.name} scripts`, onScriptAdded,
+  );
+  if (tx) {
+    tx.pruneRoots.add(hookDest);
+    tx.pruneRoots.add(scriptDest);
+  }
+  if (hooks.linkSkipped) {
+    console.warn(`  ⚠️ SKIP ${target.name}: 跳过 hooks 运行时（目标目录是符号链接/junction）-> ${hookDest}`
+      + '（未写入任何 hooks 文件，链接目标未触及）。');
+    if (scripts.installed > 0) {
+      console.log(`  ✅ ${target.name}: 门禁脚本 -> ${scriptDest}（与 hooks 容器相互独立，已正常落位）`);
+    }
+    return;
+  }
+  if (hooks.installed > 0 || existsSync(hookDest)) {
+    console.log(`  ✅ ${target.name}: hooks 运行时 -> ${hookDest}`);
+    console.log(`     门禁脚本 -> ${scriptDest}（session-start/pre-commit/stop 经 run-hook.cmd 调用）`);
+    if (process.platform === 'win32') {
+      console.log('     ℹ️  Windows 不跟踪可执行位：钩子统一由 run-hook.cmd 调 Git for Windows bash，无需 chmod +x。');
+    }
+  }
+}
+
+// --- hooks settings 读改写合并（Claude settings.json(.local) / Cursor hooks.json）---
+const HOOK_EVENTS = [
+  { event: 'SessionStart', arg: 'session-start', matcher: 'startup|clear|compact' },
+  { event: 'PreToolUse', arg: 'pre-commit', matcher: 'Bash' },
+  { event: 'Stop', arg: 'stop', matcher: '' },
+];
+const CURSOR_EVENT_KEYS = { SessionStart: 'sessionStart', PreToolUse: 'preToolUse', Stop: 'stop' };
+
+function settingsHostsForTarget(target) {
+  if (target.name === 'Claude Code') {
+    return [{
+      schema: 'claude',
+      hooksRel: '.claude/hooks',
+      candidates: ['.claude/settings.json', '.claude/settings.local.json'],
+    }];
+  }
+  if (target.name === 'Cursor') {
+    return [{ schema: 'cursor', hooksRel: '.cursor/hooks', candidates: ['.cursor/hooks.json'] }];
+  }
+  return [];
+}
+
+function toFwd(p) { return p.split(sep).join('/'); }
+
+function oursHookCommand(hooksAbsDir, schema, arg) {
+  if (schema === 'cursor') return `./hooks/run-hook.cmd ${arg}`;
+  return `"${toFwd(resolve(hooksAbsDir, 'run-hook.cmd'))}" ${arg}`;
+}
+
+function normCmd(cmd) { return String(cmd || '').replace(/\\/g, '/'); }
+function cmdIsOurs(cmd, arg) {
+  const n = normCmd(cmd);
+  return n.includes('run-hook.cmd') && n.includes(arg);
+}
+function cmdIsCompetitorJev(cmd) {
+  const n = normCmd(cmd);
+  if (!/(^|[^A-Za-z0-9-])jev-superpowers(?=\/|$|[^A-Za-z0-9-])/.test(n)) return null;
+  for (const e of HOOK_EVENTS) if (n.includes(e.arg)) return e.event;
+  return null;
+}
+
+// 遍历两种 schema 下的 command 字符串：fn(commandString, event, entry, group)
+// 可就地改写 command；返回 true 表示发生改写。
+function walkHookCommands(cfg, schema, fn) {
+  let changed = false;
+  const hooks = (cfg && typeof cfg === 'object' && cfg.hooks && typeof cfg.hooks === 'object') ? cfg.hooks : {};
+  for (const e of HOOK_EVENTS) {
+    const key = schema === 'cursor' ? CURSOR_EVENT_KEYS[e.event] : e.event;
+    const list = hooks[key];
+    if (!Array.isArray(list)) continue;
+    if (schema === 'claude') {
+      for (const group of list) {
+        if (!group || typeof group !== 'object' || !Array.isArray(group.hooks)) continue;
+        for (const h of group.hooks) {
+          if (h && typeof h === 'object' && typeof h.command === 'string') {
+            const before = h.command;
+            if (fn(h.command, e.event, h, group)) changed = true;
+            if (h.command !== before) changed = true;
+          }
+        }
+      }
+    } else {
+      for (const entry of list) {
+        const h = typeof entry === 'string' ? null : entry;
+        const cmdBefore = h ? h.command : entry;
+        if (typeof cmdBefore === 'string') {
+          let obj = h;
+          if (typeof entry === 'string') {
+            // 字符串形态就地升级为对象
+            const idx = list.indexOf(entry);
+            obj = { command: entry };
+            list[idx] = obj;
+            changed = true;
+          }
+          const before = obj.command;
+          if (fn(obj.command, e.event, obj, null)) changed = true;
+          if (obj.command !== before) changed = true;
+        }
+      }
+    }
+  }
+  return changed;
+}
+
+function wiredEvents(cfg, schema) {
+  const wired = new Set();
+  walkHookCommands(cfg, schema, (cmd, event) => {
+    if (HOOK_EVENTS.some(e => e.event === event && cmdIsOurs(cmd, e.arg))) wired.add(event);
+    return false;
+  });
+  return wired;
+}
+
+function buildOurHookEntry(schema, event, hooksAbsDir) {
+  const arg = HOOK_EVENTS.find(e => e.event === event).arg;
+  const matcher = HOOK_EVENTS.find(e => e.event === event).matcher;
+  const command = oursHookCommand(hooksAbsDir, schema, arg);
+  if (schema === 'cursor') {
+    return event === 'PreToolUse' ? { matcher, command } : { command };
+  }
+  return { matcher, hooks: [{ type: 'command', command, shell: 'bash', async: false }] };
+}
+
+// 读改写合并：保留未知键与既有条目，去重，改写 jev 上游引用，追加缺失事件。
+function mergeHooksConfig(cfg0, schema, hooksAbsDir) {
+  const cfg = cfg0 && typeof cfg0 === 'object' ? cfg0 : {};
+  if (!cfg.hooks || typeof cfg.hooks !== 'object') cfg.hooks = {};
+  const rewrites = [];
+  walkHookCommands(cfg, schema, (cmd, event, hookEntry) => {
+    const jevEvent = cmdIsCompetitorJev(cmd);
+    if (jevEvent) {
+      const arg = HOOK_EVENTS.find(e => e.event === jevEvent).arg;
+      hookEntry.command = oursHookCommand(hooksAbsDir, schema, arg);
+      rewrites.push(jevEvent);
+      return true;
+    }
+    return false;
+  });
+  const wired = wiredEvents(cfg, schema);
+  const appended = [];
+  for (const e of HOOK_EVENTS) {
+    const key = schema === 'cursor' ? CURSOR_EVENT_KEYS[e.event] : e.event;
+    if (wired.has(e.event)) continue;
+    if (!Array.isArray(cfg.hooks[key])) cfg.hooks[key] = [];
+    cfg.hooks[key].push(buildOurHookEntry(schema, e.event, hooksAbsDir));
+    appended.push(e.event);
+  }
+  return { cfg, rewrites, appended, wired: new Set([...wired, ...appended, ...rewrites]) };
+}
+
+// 选择实际接线文件：优先已含 hook 配置/本包或 jev 引用的候选；否则第一个（主文件）。
+function chooseSettingsCandidate(baseDir, host) {
+  const existing = host.candidates
+    .map(rel => ({ rel, abs: resolve(baseDir, rel) }))
+    .filter(x => existsSync(x.abs));
+  for (const x of existing) {
+    try {
+      const cfg = JSON.parse(readFileSync(x.abs, 'utf8'));
+      const raw = JSON.stringify(cfg || {});
+      if (raw.includes('run-hook.cmd') || /jev-superpowers(?!-zh)/.test(raw)) return x;
+    } catch { /* 坏文件在 preflight 已阻断 */ }
+  }
+  for (const x of existing) {
+    try {
+      const cfg = JSON.parse(readFileSync(x.abs, 'utf8'));
+      if (cfg && cfg.hooks && typeof cfg.hooks === 'object') return x;
+    } catch {}
+  }
+  return { rel: host.candidates[0], abs: resolve(baseDir, host.candidates[0]) };
+}
+
+// --- 预检（preflight）：收集五级处置矩阵，不做任何写盘 ---
+function preflightTarget(target, baseDir, isGlobal, opts) {
+  const plan = { target, isGlobal, blocks: [], errors: [], skills: [], router: [], hosts: [] };
+
+  // 1) 竞品插件启用记录（硬阻断，--force 不绕过）
+  for (const hit of scanPluginCompetitors(baseDir, target)) {
+    plan.blocks.push({ kind: 'plugin', file: hit.file, name: hit.name });
+  }
+
+  // 2) 同名技能来源识别
+  const relDir = isGlobal ? globalRelDir(target) : target.dir;
+  if (relDir) {
+    const dest = resolve(baseDir, relDir);
+    let destStat;
+    try { destStat = lstatSync(dest); } catch { destStat = null; }
+    if (destStat && destStat.isSymbolicLink()) {
+      plan.errors.push({ kind: 'link-container', path: dest });
+    } else {
+      for (const name of selectedSkillNames(!!opts.noJev)) {
+        const dst = resolve(dest, name);
+        let st;
+        try { st = lstatSync(dst); } catch { st = null; }
+        if (!st) { plan.skills.push({ name, action: 'add' }); continue; }
+        if (st.isSymbolicLink()) { plan.skills.push({ name, action: 'skip', warn: 'link' }); continue; }
+        const c = classifySkillSource(dst);
+        const skillReady = existsSync(resolve(dst, 'SKILL.md'))
+          && readSkillBody(dst) && readSkillBody(dst).trim().length > 0;
+        if (c.source === 'ours') {
+          const oldVer = c.version;
+          const stale = oldVer && compareVersions(oldVer, PKG.version) < 0;
+          if (stale) {
+            // meta 明确指向更旧版本：即使文件已损坏也按自升级处置（覆盖即修复）。
+            plan.skills.push({ name, action: 'upgrade', reason: 'self', from: oldVer, to: PKG.version,
+              detail: `本包旧版自升级（v${oldVer} -> v${PKG.version}${skillReady ? '' : '；同时修复损坏/缺失文件'}）` });
+          } else if (!skillReady) {
+            plan.skills.push({ name, action: 'upgrade', reason: 'repair', detail: '本包技能损坏（SKILL.md 缺失/为空），修复重装' });
+          } else if (!oldVer) {
+            plan.skills.push({ name, action: 'upgrade', reason: 'brand', detail: '识别为本包旧版（品牌特征、无 meta），补齐元数据覆盖' });
+          } else {
+            plan.skills.push({ name, action: 'skip-ours', version: oldVer });
+          }
+          continue;
+        }
+        if (c.source === 'empty' || isDirEmpty(dst)) { plan.skills.push({ name, action: 'add', empty: true }); continue; }
+        if (opts.adoptSkills) {
+          plan.skills.push({ name, action: 'adopt', source: c.source, detail: `--adopt-skills 备份后接管（来源：${sourceLabel(c.source)}）` });
+        } else {
+          plan.skills.push({ name, action: 'skip', source: c.source });
+        }
+      }
+    }
+  }
+
+  // 3) router（只评估已存在文件；新文件创建不打处置标签）
+  const desc = routerDescriptor(target, isGlobal);
+  if (desc) {
+    for (const rel of desc.shared || []) {
+      const abs = resolve(baseDir, rel);
+      if (!existsSync(abs)) continue;
+      let text;
+      try { text = readFileSync(abs, 'utf8'); } catch { continue; }
+      const st = analyzeRouterText(text);
+      if (st.danglingOurs || st.danglingZh) {
+        plan.router.push({ kind: 'shared', rel, status: 'dangling' });
+      } else if (st.oursTargets.includes(target.name)) {
+        plan.router.push({ kind: 'shared', rel, status: 'ours' });
+      } else if (st.hasCompetitor) {
+        plan.router.push({ kind: 'shared', rel, status: opts.keepRouter ? 'keep' : 'migrate' });
+      } else {
+        plan.router.push({ kind: 'shared', rel, status: 'clean' });
+      }
+    }
+    for (const s of desc.standalone || []) {
+      const legacyAbs = resolve(baseDir, s.legacyRel);
+      if (existsSync(legacyAbs)) {
+        plan.router.push({ kind: 'standalone', rel: s.legacyRel, oursRel: s.oursRel,
+          status: opts.keepRouter ? 'keep' : 'migrate' });
+      }
+    }
+  }
+
+  // 4) hooks settings（损坏 JSON 硬阻断 BLOCK）
+  if (!opts.noJev) {
+    for (const host of settingsHostsForTarget(target)) {
+      let corrupt = null;
+      for (const rel of host.candidates) {
+        const abs = resolve(baseDir, rel);
+        if (!existsSync(abs)) continue;
+        try {
+          JSON.parse(readFileSync(abs, 'utf8'));
+        } catch {
+          corrupt = rel;
+          break;
+        }
+      }
+      if (corrupt) {
+        plan.blocks.push({ kind: 'settings-corrupt', file: corrupt });
+        plan.hosts.push({ ...host, status: 'blocked', file: corrupt });
+        continue;
+      }
+      if (opts.keepRouter) { plan.hosts.push({ ...host, status: 'keep' }); continue; }
+      const chosen = chooseSettingsCandidate(baseDir, host);
+      let status = 'create';
+      let rewrites = [];
+      if (existsSync(chosen.abs)) {
+        const cfg = JSON.parse(readFileSync(chosen.abs, 'utf8'));
+        const wired = wiredEvents(cfg, host.schema);
+        const r = mergeHooksConfig(JSON.parse(readFileSync(chosen.abs, 'utf8')), host.schema, resolve(baseDir, host.hooksRel));
+        rewrites = r.rewrites;
+        status = wired.size === HOOK_EVENTS.length ? 'wired' : (rewrites.length ? 'rewrite' : 'merge');
+      }
+      plan.hosts.push({ ...host, status, chosen: chosen.rel });
+    }
+  }
+
+  return plan;
+}
+
+function sourceLabel(source) {
+  return {
+    zh: 'superpowers-zh（同源中文版，行为基本等价）',
+    jev: '英文 TypeSafe Jev 硬 STOP 旧版（jev-superpowers；软降级不生效）',
+    obra: 'obra/superpowers 英文原版（不路由中文/jev 技能）',
+    unknown: '来源不明（用户/他方内容）',
+  }[source] || source;
+}
+
+function printPlanMatrix(plan, opts) {
+  const scopeTag = plan.isGlobal ? '全局' : '项目级';
+  console.log(`\n  ── 预检矩阵：${plan.target.name}（${scopeTag}${opts.detectOnly ? '；--detect-only 只报告不写盘' : ''}）──`);
+  for (const s of plan.skills) {
+    if (s.action === 'add') {
+      console.log(`  [ADD]     ${s.name}：补缺安装${s.empty ? '（接管空目录）' : ''}`);
+    } else if (s.action === 'skip-ours') {
+      console.log(`  [SKIP]    ${s.name}：本包已安装（v${s.version || PKG.version}），幂等跳过`);
+    } else if (s.action === 'upgrade') {
+      console.log(`  [MIGRATE] ${s.name}：${s.detail}`);
+    } else if (s.action === 'adopt') {
+      console.log(`  [MIGRATE] ${s.name}：${s.detail}`);
+    } else if (s.warn === 'link') {
+      console.log(`  [WARN]    ${s.name}：目标是符号链接/junction，防穿越跳过`);
+    } else if (s.source === 'unknown') {
+      console.log(`  [WARN]    ${s.name}：同名目录来源不明（用户/他方内容，无法识别发行版），最保守保留不动（零覆盖；确认可替换用 --adopt-skills 接管）`);
+    } else if (s.source === 'jev') {
+      console.log(`  [SKIP]    ${s.name}：同名技能已存在，来源：${sourceLabel('jev')}；默认保留，--adopt-skills 可接管`);
+    } else if (s.source) {
+      console.log(`  [SKIP]    ${s.name}：同名技能已存在，来源：${sourceLabel(s.source)}；默认保留，--adopt-skills 可接管`);
+    }
+  }
+  for (const r of plan.router) {
+    if (r.status === 'migrate') {
+      console.log(`  [MIGRATE] ${r.rel}：检测到旧发行版引导段，将备份整文件后精确切除并写入本包成对哨兵（用户内容保留）`);
+    } else if (r.status === 'dangling') {
+      console.log(`  [WARN]    ${r.rel}：哨兵 begin 无配对 end（悬空/畸形），不接管不追加，请手工修复标记`);
+    } else if (r.status === 'keep') {
+      console.log(`  [SKIP]    ${r.rel}：--keep-router 保留旧引导段/规则文件不动`);
+    } else if (r.status === 'ours') {
+      console.log(`  [SKIP]    ${r.rel}：本包引导区块已在位，幂等跳过`);
+    }
+  }
+  for (const h of plan.hosts) {
+    if (h.status === 'blocked') {
+      console.log(`  [BLOCK]   ${h.file}：hooks 设置文件不是合法 JSON（静默覆盖会丢配置）`);
+    } else if (h.status === 'keep') {
+      console.log(`  [SKIP]    ${h.candidates[0]}：--keep-router 不做 hooks 接线合并`);
+    } else if (h.status === 'rewrite') {
+      console.log(`  [MIGRATE] ${h.chosen}：检测到 jev-superpowers 旧 hooks 引用，将备份后改写为本包 run-hook.cmd 接线`);
+    } else if (h.status === 'merge') {
+      console.log(`  [MIGRATE] ${h.chosen}：hooks 接线读改写合并（保留未知键与既有 hook 条目，不重复追加），改前备份`);
+    } else if (h.status === 'wired') {
+      console.log(`  [SKIP]    ${h.chosen}：本包 hooks 已接线，幂等跳过`);
+    }
+  }
+  for (const e of plan.errors) {
+    if (e.kind === 'link-container') {
+      console.log(`  [BLOCK]   ${e.path}：技能容器是符号链接/junction，防穿越禁止写入该目标`);
+    }
+  }
+  for (const b of plan.blocks) {
+    if (b.kind === 'plugin') {
+      console.log(`  [BLOCK]   检测到竞品插件启用记录 ${b.file} -> ${b.name}：插件与文件安装会重复生效，必须先卸载/禁用插件`);
+    } else if (b.kind === 'settings-corrupt') {
+      // 已在 hosts 行打印
+    }
+  }
+}
+
+// --- 备份轮次：.jevzh/backups/<ts>/，整文件/整目录首拍快照 + manifest ---
+function makeBackupTs(when = new Date()) {
+  const p2 = n => String(n).padStart(2, '0');
+  const ymd = `${when.getFullYear()}${p2(when.getMonth() + 1)}${p2(when.getDate())}`;
+  // 毫秒必须补满 3 位（p2 只有 2 位，会生成 8 位尾部导致时间戳正则不匹配、轮转漏删）。
+  const ms = String(when.getMilliseconds()).padStart(3, '0');
+  const hms = `${p2(when.getHours())}${p2(when.getMinutes())}${p2(when.getSeconds())}${ms}`;
+  return `${ymd}T${hms}-${randomBytes(2).toString('hex')}`;
+}
+const BACKUP_KEEP = 3;
+const BACKUP_TS_RE = /^\d{8}T\d{9}-[0-9a-f]+$/;
+
+function backupsRootFor(baseDir) {
+  return resolve(baseDir, '.jevzh', 'backups');
+}
+
+function createBackupRun(baseDir, isGlobal, kind = 'install', extra = {}) {
+  const ts = makeBackupTs();
+  const root = resolve(backupsRootFor(baseDir), ts);
+  let seq = 0;
+  let fsReady = false;
+  const payloadByRel = new Map(); // rel -> {kind, payload, existed}
+  const targetEntries = new Map();
+
+  const ensureFs = () => {
+    if (!fsReady) { mkdirSync(root, { recursive: true }); fsReady = true; }
+  };
+  const register = (targetName, rel, kindEntry, existed, payload) => {
+    if (!targetEntries.has(targetName)) targetEntries.set(targetName, []);
+    const list = targetEntries.get(targetName);
+    if (!list.some(e => e.relPath === rel)) {
+      list.push({ relPath: rel.split(sep).join('/'), kind: kindEntry, existed, payload });
+    } else {
+      const old = list.find(e => e.relPath === rel);
+      // 同一 target 内先记 new 后记 existed：以更保守的 existed 为准
+      if (existed) { old.existed = true; old.payload = payload; }
+    }
+  };
+
+  const api = {
+    ts,
+    root,
+    kind,
+    droppedTargets: new Set(),
+    hasCapture(rel) { return payloadByRel.has(rel); },
+    captureFile(targetName, abs, rel, existed) {
+      if (!payloadByRel.has(rel)) {
+        ensureFs();
+        seq += 1;
+        const payload = `files/${String(seq).padStart(4, '0')}`;
+        const dst = resolve(root, payload);
+        mkdirSync(dirname(dst), { recursive: true });
+        copyFileSync(abs, dst);
+        payloadByRel.set(rel, { kind: 'file', payload, existed });
+      }
+      const info = payloadByRel.get(rel);
+      register(targetName, rel, 'file', existed, info.payload);
+      return { ...info, firstCapture: true };
+    },
+    noteFile(targetName, rel, existed, kindEntry = 'file') {
+      if (!payloadByRel.has(rel)) payloadByRel.set(rel, { kind: kindEntry, payload: null, existed });
+      const info = payloadByRel.get(rel);
+      register(targetName, rel, kindEntry, existed, info.payload);
+    },
+    captureDir(targetName, abs, rel) {
+      if (!payloadByRel.has(rel)) {
+        ensureFs();
+        seq += 1;
+        const payload = `dirs/${String(seq).padStart(4, '0')}`;
+        const dst = resolve(root, payload);
+        mkdirSync(dst, { recursive: true });
+        copyDirSync(abs, dst);
+        payloadByRel.set(rel, { kind: 'dir', payload, existed: true });
+      }
+      const info = payloadByRel.get(rel);
+      register(targetName, rel, 'dir', true, info.payload);
+      return info;
+    },
+    payloadFor(rel) { return payloadByRel.get(rel) || null; },
+    dropTarget(targetName) { this.droppedTargets.add(targetName); },
+    finalize() {
+      const committed = [...targetEntries.entries()]
+        .filter(([t]) => !this.droppedTargets.has(t))
+        .map(([target, entries]) => ({ target, entries }));
+      const destructive = committed.some(t => t.entries.some(e => e.existed === true));
+      if (!destructive) {
+        try { rmSync(root, { recursive: true, force: true }); } catch {}
+        pruneBackupRoot(baseDir);
+        return null;
+      }
+      // 清理无引用载荷
+      const referenced = new Set();
+      for (const t of committed) for (const e of t.entries) if (e.payload) referenced.add(e.payload);
+      for (const [, info] of payloadByRel) {
+        if (info.payload && !referenced.has(info.payload)) {
+          try { rmSync(resolve(root, info.payload), { recursive: true, force: true }); } catch {}
+        }
+      }
+      const manifest = {
+        schema: 1,
+        kind,
+        ts,
+        date: new Date().toISOString(),
+        pkg: PKG.name,
+        version: PKG.version,
+        scope: isGlobal ? 'global' : 'project',
+        targets: committed,
+        ...extra,
+      };
+      atomicWriteFileSync(resolve(root, 'manifest.json'), JSON.stringify(manifest, null, 2) + '\n');
+      rotateBackups(backupsRootFor(baseDir));
+      return ts;
+    },
+  };
+  return api;
+}
+
+function pruneBackupRoot(baseDir) {
+  const bkRoot = backupsRootFor(baseDir);
+  try {
+    if (readdirSync(bkRoot).length === 0) {
+      rmSync(bkRoot, { recursive: true, force: true });
+      const jevzh = resolve(baseDir, '.jevzh');
+      if (existsSync(jevzh) && readdirSync(jevzh).length === 0) rmSync(jevzh, { recursive: true, force: true });
+    }
+  } catch {}
+}
+
+// Windows 下刚写出的目录可能被杀软/索引器短暂占用，rmSync 偶发 EPERM/EBUSY；
+// 轮转删除做几次短重试，避免「应留 3 份实际 4 份」的非确定性失败。
+function rmWithRetries(target, attempts = 4, delayMs = 40) {
+  for (let i = 0; i < attempts; i++) {
+    try {
+      rmSync(target, { recursive: true, force: true });
+      return true;
+    } catch (e) {
+      if (i === attempts - 1) return false;
+      // 同步短眠（无第三方依赖）：SharedArrayBuffer + Atomics.wait
+      const sab = new SharedArrayBuffer(4);
+      Atomics.wait(new Int32Array(sab), 0, 0, delayMs * (i + 1));
+    }
+  }
+  return false;
+}
+
+function rotateBackups(bkRoot) {
+  let entries;
+  try { entries = readdirSync(bkRoot, { withFileTypes: true }); } catch { return; }
+  const dirs = entries.filter(e => e.isDirectory() && BACKUP_TS_RE.test(e.name)).map(e => e.name).sort();
+  while (dirs.length > BACKUP_KEEP) {
+    const old = dirs.shift();
+    if (!rmWithRetries(resolve(bkRoot, old))) {
+      // 持续占用删不掉时停止继续轮转（保留多份总比误判安全；下次安装会再次尝试）。
+      break;
+    }
+  }
+}
+
+// --- 按目标事务 ---
+let ACTIVE_TX = null;
+
+function createTargetTransaction(run, target, baseDir, isGlobal, opts) {
+  const tx = {
+    run,
+    target,
+    baseDir,
+    isGlobal,
+    opts,
+    undo: [],
+    emptyDirs: [],
+    pruneRoots: new Set(),
+    warnings: [],
+    // 事务开始前就已存在的目录（如夹具/用户预置的 .claude 容器）：回滚剪空时
+    // 绝不能移除——否则自动检测在重跑时会丢失目标标记（用例 8 自愈前提）。
+    preExistingDirs: new Set(),
+    // 事务内唯一允许的建目录入口：mkdir -p，同时把已存在祖先登记为 pre-existing。
+    ensureDir(abs) {
+      let d = resolve(abs);
+      const chain = [];
+      for (let guard = 0; guard < 32; guard++) {
+        let st;
+        try { st = lstatSync(d); } catch { st = null; }
+        if (st) {
+          // 命中已存在祖先：它本身及向上全部祖先都是事务前存量
+          if (st.isDirectory()) this.preExistingDirs.add(d);
+          let a = dirname(d);
+          while (isInsideDir(baseDir, a) || a === resolve(baseDir)) {
+            this.preExistingDirs.add(a);
+            if (a === resolve(baseDir)) break;
+            a = dirname(a);
+          }
+          break;
+        }
+        chain.push(d);
+        if (d === resolve(baseDir)) break;
+        d = dirname(d);
+      }
+      mkdirSync(abs, { recursive: true });
+      return chain;
+    },
+    trackCreatedFile(abs) {
+      const rel = relFromBase(baseDir, abs);
+      run.noteFile(target.name, rel, false);
+      this.undo.push({ type: 'file-delete', rel });
+      this.pruneRoots.add(dirname(resolve(baseDir, rel)));
+    },
+    noteExistingEmptyDir(rel) {
+      this.emptyDirs.push(rel);
+    },
+    trackCreatedDir(abs, rel) {
+      run.noteFile(target.name, rel, false, 'dir');
+      this.undo.push({ type: 'dir-delete', rel });
+      this.pruneRoots.add(dirname(resolve(baseDir, rel)));
+    },
+    backupAndReplaceDir(abs, rel) {
+      run.captureDir(target.name, abs, rel);
+      let st;
+      try { st = lstatSync(abs); } catch { st = null; }
+      if (st && !st.isSymbolicLink()) rmSync(abs, { recursive: true, force: true });
+      else if (st) rmSync(abs, { force: true });
+      this.undo.push({ type: 'dir-restore', rel, payload: run.payloadFor(rel).payload });
+      mkdirSync(abs, { recursive: true });
+    },
+    modifyOrCreateFile(abs, rel, data) {
+      let existed = false;
+      try { existed = lstatSync(abs).isFile(); } catch {}
+      if (existed) {
+        // 幂等短路：字节级一致则不写盘、不备份（否则连跑会产生「空备份」并破坏指纹）
+        if (readFileSync(abs, 'utf8') === data) return true;
+        run.captureFile(target.name, abs, rel, true);
+        this.undo.push({ type: 'file-restore', rel, payload: run.payloadFor(rel).payload });
+      } else {
+        this.ensureDir(dirname(abs));
+        run.noteFile(target.name, rel, false);
+        this.undo.push({ type: 'file-delete', rel });
+      }
+      atomicWriteFileSync(abs, data);
+      return existed;
+    },
+    appendShared(abs, body, label) {
+      const rel = relFromBase(baseDir, abs);
+      let st;
+      try { st = lstatSync(abs); } catch { st = null; }
+      if (st && st.isSymbolicLink()) {
+        const msg = `${label}: ${abs} 是符号链接/junction，防穿越保留不动。`;
+        console.warn(`  ⚠️ WARN ${msg}`);
+        this.warnings.push(msg);
+        return;
+      }
+      this.ensureDir(dirname(abs));
+      if (!st) {
+        atomicWriteFileSync(abs, wrapWithSentinelTarget(body, target.name));
+        run.noteFile(target.name, rel, false);
+        this.undo.push({ type: 'file-delete', rel });
+        console.log(`  ✅ ${label}: bootstrap -> ${abs}`);
+        return;
+      }
+      const original = readFileSync(abs, 'utf8');
+      const state = analyzeRouterText(original);
+      if (state.danglingOurs || state.danglingZh) {
+        const msg = `${label}: ${abs} 存在悬空哨兵（begin 无配对 end），边界不可判定，本次不接管也不追加，请手工修复标记。`;
+        console.warn(`  ⚠️ WARN ${msg}`);
+        this.warnings.push(msg);
+        return;
+      }
+      if (state.oursTargets.includes(target.name)) {
+        console.log(`  ✅ ${label}: 已包含本 target 的 jevzh 引导区块，跳过 -> ${abs}`);
+        return;
+      }
+      if (state.hasCompetitor) {
+        if (opts.keepRouter) {
+          const msg = `${label}: ${abs} 已含其他发行版引导区块，--keep-router 保留旧段不动（同名路由可能并存，注意实际生效归属）。`;
+          console.warn(`  ⚠️ WARN ${msg}`);
+          this.warnings.push(msg);
+          return;
+        }
+        let text = original;
+        const zhPair = cutPairedSections(text, ZH_SENTINEL_BEGIN, ZH_SENTINEL_END);
+        if (zhPair.malformed) {
+          const msg = `${label}: ${abs} 旧 superpowers-zh 哨兵畸形（嵌套/无法配对），整文件保留请手工处理。`;
+          console.warn(`  ⚠️ WARN ${msg}`);
+          this.warnings.push(msg);
+          return;
+        }
+        text = zhPair.text;
+        const legacy = cutLegacyZhMarkedSection(text);
+        if (legacy.unresolvable) {
+          const msg = `${label}: ${abs} 旧 superpowers-zh 区段边界不可识别，整文件保留请手工处理。`;
+          console.warn(`  ⚠️ WARN ${msg}`);
+          this.warnings.push(msg);
+          return;
+        }
+        text = legacy.text;
+        const foreign = cutForeignMarkedSections(text);
+        if (foreign.unresolvable) {
+          const msg = `${label}: ${abs} 含英文 jev/obra 旧引导但边界不可判定，整文件保留请手工处理。`;
+          console.warn(`  ⚠️ WARN ${msg}`);
+          this.warnings.push(msg);
+          return;
+        }
+        text = foreign.text;
+        if (analyzeRouterText(text).hasCompetitor || text === original) {
+          const msg = `${label}: ${abs} 含竞品引导痕迹但无法安全精确切除，整文件保留（可手工删除旧段后重跑）。`;
+          console.warn(`  ⚠️ WARN ${msg}`);
+          this.warnings.push(msg);
+          return;
+        }
+        run.captureFile(target.name, abs, rel, true);
+        const next = `${text.replace(/\s+$/, '')}\n\n${wrapWithSentinelTarget(body, target.name)}`;
+        atomicWriteFileSync(abs, next);
+        this.undo.push({ type: 'file-restore', rel, payload: run.payloadFor(rel).payload });
+        console.log(`  🔄 [MIGRATE] ${label}: 备份并切除旧发行版引导段，写入本包成对哨兵 -> ${abs}`);
+        return;
+      }
+      // 干净用户文件（可能已含其他 target 区块）：纯追加本 target 区块。
+      const next = `${original.replace(/\s+$/, '')}\n\n${wrapWithSentinelTarget(body, target.name)}`;
+      atomicWriteFileSync(abs, next);
+      this.undo.push({ type: 'section-remove', rel, target: target.name });
+      console.log(`  ✅ ${label}: 追加 skills 引用 -> ${abs}`);
+    },
+    writeStandalone(abs, body, label, legacyAbs) {
+      const rel = relFromBase(baseDir, abs);
+      let st;
+      try { st = lstatSync(abs); } catch { st = null; }
+      if (st && st.isSymbolicLink()) {
+        console.warn(`  ⚠️ WARN ${label}: ${abs} 是符号链接/junction，防穿越保留不动。`);
+        return;
+      }
+      this.ensureDir(dirname(abs));
+      const oursReady = existsSync(abs) && readFileSync(abs, 'utf8') === body;
+      if (!existsSync(abs)) {
+        run.noteFile(target.name, rel, false);
+        this.undo.push({ type: 'file-delete', rel });
+        atomicWriteFileSync(abs, body);
+      } else if (!oursReady) {
+        // 本管文件被改动：也备份后覆盖（restore 可回退）。
+        run.captureFile(target.name, abs, rel, true);
+        this.undo.push({ type: 'file-restore', rel, payload: run.payloadFor(rel).payload });
+        atomicWriteFileSync(abs, body);
+      }
+      console.log(`  ✅ ${label}: bootstrap rule -> ${abs}`);
+      if (legacyAbs && existsSync(legacyAbs)) {
+        const relLegacy = relFromBase(baseDir, legacyAbs);
+        let lst;
+        try { lst = lstatSync(legacyAbs); } catch { lst = null; }
+        if (lst && lst.isSymbolicLink()) {
+          console.warn(`  ⚠️ WARN ${label}: 旧规则文件 ${legacyAbs} 是符号链接，保留不动。`);
+          return;
+        }
+        if (lst && lst.isDirectory()) {
+          console.warn(`  ⚠️ WARN ${label}: 旧规则路径 ${legacyAbs} 是目录而非文件，保留不动。`);
+          return;
+        }
+        if (opts.keepRouter) {
+          console.warn(`  ⚠️ WARN ${label}: --keep-router 保留旧规则文件 ${legacyAbs}（双份常驻规则可能同时生效）。`);
+          return;
+        }
+        run.captureFile(target.name, legacyAbs, relLegacy, true);
+        rmSync(legacyAbs, { force: true });
+        this.undo.push({ type: 'file-restore', rel: relLegacy, payload: run.payloadFor(relLegacy).payload });
+        console.log(`  🔄 [MIGRATE] ${label}: 备份后移除旧 superpowers-zh 规则文件 -> ${legacyAbs}`);
+      }
+    },
+    checkFault(stage) {
+      const v = process.env.JEVZH_FAULT;
+      if (!v) return;
+      const [s, alias] = v.split(':');
+      if (s !== stage || !alias) return;
+      const wanted = TOOL_ALIASES[alias.toLowerCase()];
+      if (wanted && wanted === target.name) {
+        throw new Error(`JEVZH_FAULT 注入：${stage} 阶段故意失败（${target.name}）`);
+      }
+    },
+    async rollback(err) {
+      console.warn(`  ↩️  [回滚] ${target.name} 事务失败（${err && err.message ? err.message : err}）：恢复该目标改动前状态…`);
+      for (const change of [...this.undo].reverse()) {
+        try {
+          const abs = resolve(baseDir, change.rel);
+          if (!isInsideDir(baseDir, abs)) continue;
+          if (change.type === 'file-delete') {
+            let s;
+            try { s = lstatSync(abs); } catch { s = null; }
+            if (s && (s.isFile() || s.isSymbolicLink())) rmSync(abs, { force: true });
+          } else if (change.type === 'file-restore') {
+            const src = resolve(run.root, change.payload);
+            mkdirSync(dirname(abs), { recursive: true });
+            copyFileSync(src, abs);
+          } else if (change.type === 'dir-restore') {
+            let s;
+            try { s = lstatSync(abs); } catch { s = null; }
+            if (s) {
+              if (s.isSymbolicLink()) rmSync(abs, { force: true });
+              else rmSync(abs, { recursive: true, force: true });
+            }
+            copyDirSync(resolve(run.root, change.payload), abs);
+          } else if (change.type === 'dir-delete') {
+            let s;
+            try { s = lstatSync(abs); } catch { s = null; }
+            if (s) {
+              if (s.isSymbolicLink()) rmSync(abs, { force: true });
+              else rmSync(abs, { recursive: true, force: true });
+            }
+          } else if (change.type === 'section-remove') {
+            if (existsSync(abs) && lstatSync(abs).isFile()) {
+              const text = readFileSync(abs, 'utf8');
+              const cut = cutPairedSections(text, OUR_BEGIN_RE, SENTINEL_END, { onlyTarget: change.target });
+              if (cut.cut && !cut.malformed) writeOrDelete(abs, cut.text, '');
+            }
+          }
+        } catch (e) {
+          console.warn(`  ⚠️ [回滚] 恢复 ${change.rel} 失败：${e.message}（请从 .jevzh/backups 手工恢复）`);
+        }
+      }
+      for (const rel of this.emptyDirs) {
+        try {
+          const abs = resolve(baseDir, rel);
+          if (!existsSync(abs)) mkdirSync(abs, { recursive: true });
+        } catch {}
+      }
+      run.dropTarget(target.name);
+      // 清空本事务产生的空目录（向上修剪但绝不越过 baseDir）
+      const roots = [...this.pruneRoots];
+      for (const change of this.undo) {
+        const d = dirname(resolve(baseDir, change.rel));
+        if (!roots.includes(d)) roots.push(d);
+      }
+      for (let d0 of roots) {
+        let d = d0;
+        for (let guard = 0; guard < 12; guard++) {
+          if (!isInsideDir(baseDir, d) || resolve(d) === resolve(baseDir)) break;
+          if (this.preExistingDirs.has(resolve(d))) break; // 事务前存量目录保留
+          try {
+            if (existsSync(d) && lstatSync(d).isDirectory() && readdirSync(d).length === 0) {
+              // Windows 下 recursive:false 删目录会抛 EISDIR（POSIX 为 EPERM）；
+              // 已确认目录为空，recursive:true 等价于 rmdir 且跨平台可用。
+              rmSync(d, { recursive: true, force: true });
+            } else break;
+          } catch { break; }
+          d = dirname(d);
+        }
+      }
+    },
+    validate() {
+      // 哨兵成对、JSON 可解析、无半写临时文件。
+      for (const change of this.undo) {
+        const abs = resolve(baseDir, change.rel);
+        if (change.rel.endsWith('.md') && existsSync(abs)) {
+          const text = readFileSync(abs, 'utf8');
+          const b = (text.match(new RegExp(OUR_BEGIN_RE.source, 'g')) || []).length;
+          const e2 = countOccurrences(text, SENTINEL_END);
+          if (b !== e2) throw new Error(`校验失败：${change.rel} 哨兵不成对（begin=${b}, end=${e2}）`);
+        }
+        if (/settings.*\.json$|hooks\.json$/.test(change.rel) && existsSync(abs)) {
+          JSON.parse(readFileSync(abs, 'utf8'));
+        }
+        const dirOf = dirname(abs);
+        if (existsSync(dirOf)) {
+          for (const junk of readdirSync(dirOf)) {
+            if (/^\.[^.]+\.[0-9a-f]{16}\.tmp$/.test(junk)) throw new Error(`校验失败：残留临时文件 ${resolve(dirOf, junk)}`);
+          }
+        }
+      }
+    },
+  };
+  return tx;
+}
+
+// hooks settings 接线阶段（事务内；--keep-router/--no-jev 跳过）。
+function installSettingsForTarget(tx, plan) {
+  const { target, baseDir, isGlobal, opts, run } = tx;
+  if (opts.noJev || opts.keepRouter) return;
+  for (const host of plan.hosts) {
+    if (host.status === 'blocked' || host.status === 'keep') continue;
+    const chosen = chooseSettingsCandidate(baseDir, host);
+    const hooksAbsDir = resolve(baseDir, host.hooksRel);
+    let cfg = {};
+    if (existsSync(chosen.abs)) cfg = JSON.parse(readFileSync(chosen.abs, 'utf8'));
+    const merged = mergeHooksConfig(cfg, host.schema, hooksAbsDir);
+    const data = JSON.stringify(merged.cfg, null, 2) + '\n';
+    const existed = tx.modifyOrCreateFile(chosen.abs, relFromBase(baseDir, chosen.abs), data);
+    // 校验：三类事件均已接线且 JSON 可解析
+    JSON.parse(data);
+    const wired = wiredEvents(merged.cfg, host.schema);
+    if (wired.size !== HOOK_EVENTS.length) {
+      throw new Error(`校验失败：${chosen.rel} hooks 接线不完整（${[...wired].join(',') || '无'}）`);
+    }
+    console.log(`  🔄 ${target.name}: hooks 已${existed ? '合并接线' : '接线（新建）'} -> ${chosen.abs}${merged.rewrites.length ? `（改写 ${merged.rewrites.length} 条 jev 旧引用）` : ''}`);
+  }
+}
+
+// 故障点常量在各阶段之间触发（JEVZH_FAULT=<stage>:<alias>，仅测试注入）。
+function runBootstrapsForTarget(target, baseDir, isGlobal, opts) {
+  if (target.name === 'Trae') generateTraeBootstrapRule(baseDir, opts);
+  if (target.name === 'Qoder') generateQoderBootstrap(baseDir, isGlobal, opts);
+  if (target.name === 'Antigravity') generateAntigravityBootstrap(baseDir, isGlobal, opts);
+  if (target.name === 'Aider') generateAiderBootstrap(baseDir, opts);
+  if (target.name === 'Gemini CLI') generateGeminiBootstrap(baseDir, isGlobal, opts);
+  if (target.name === 'Qwen Code') generateQwenBootstrap(baseDir, isGlobal, opts);
+  if (target.name === 'VS Code') generateVSCodeBootstrap(baseDir, opts);
+  if (target.name === 'Claw Code') generateClawBootstrap(baseDir, opts);
+  if (target.name === 'Hermes Agent') generateHermesBootstrap(baseDir, isGlobal, opts);
+  if (target.name === 'Claude Code') generateClaudeCodeBootstrap(baseDir, isGlobal, opts);
+  if (target.name === 'CodeBuddy') generateCodeBuddyBootstrap(baseDir, isGlobal, opts);
+  if (target.name === 'DeepSeek Harness') generateDeepSeekHarnessBootstrap(baseDir, isGlobal, opts);
+  if (target.name === 'Reasonix' && !isGlobal) generateReasonixBootstrap(baseDir, opts);
+  if (target.name === 'Kiro') generateKiroSteeringIndex(baseDir, opts);
+  if (target.name === 'Cline') generateClineBootstrapRule(baseDir, opts);
+  if (target.name === 'Kilo Code') generateKiloCodeBootstrapRule(baseDir, opts);
+}
+
+async function runTargetTransaction(plan, baseDir, opts, run) {
+  const { target, isGlobal } = plan;
+  // S-7：重定向的 dirWin 全局目标，事务护栏根/技能 rel 根切到目标文件根；
+  // router/hooks 仍走 home（这两个 target 本就没有这些载体，传 home 为空操作）。
+  const txBase = globalTargetFileBase(target, isGlobal, baseDir);
+  const tx = createTargetTransaction(run, target, txBase, isGlobal, opts);
+  ACTIVE_TX = tx;
+  try {
+    // 阶段 1：技能
+    installSkillsForTarget(target, txBase, isGlobal, opts, plan, run);
+    tx.checkFault('post-skills');
+    // 阶段 2：router/bootstrap
+    runBootstrapsForTarget(target, baseDir, isGlobal, opts);
+    tx.checkFault('post-router');
+    // 阶段 3：hooks 运行时 + settings 接线
+    if (!opts.noJev) {
+      installHooksForTarget(target, baseDir, tx);
+      installSettingsForTarget(tx, plan);
+      tx.checkFault('post-settings');
+    }
+    tx.validate();
+    return { ok: true, tx };
+  } catch (err) {
+    await tx.rollback(err);
+    return { ok: false, tx, error: err };
+  } finally {
+    ACTIVE_TX = null;
+  }
+}
+
+// ===========================================================================
+// doctor：只读诊断（竞品来源 / router 归属 / SKIP 残留 / hooks / 就绪 / 备份）
+// ===========================================================================
+async function doctor(forceToolName, opts) {
+  const isGlobal = !!opts.isGlobal;
+  const baseDir = isGlobal ? homedir() : PROJECT_DIR;
+  const plans = [];
+  let pool;
+  if (forceToolName) {
+    const t = TARGETS.find(x => x.name === forceToolName);
+    if (!t) return 64;
+    pool = [t];
+  } else {
+    pool = (isGlobal ? GLOBAL_TARGETS : PROJECT_TARGETS).filter(t => {
+      const dm = isGlobal ? t.global.detect : t.detect;
+      const ds = Array.isArray(dm) ? dm : [dm];
+      return ds.some(d => existsSync(resolve(baseDir, d)));
+    });
+  }
+  console.log(`\n  jevzh doctor v${PKG.version}（${isGlobal ? '全局' : '项目级'}；只读，不写盘）  目标: ${baseDir}\n`);
+  if (pool.length === 0) {
+    console.log('  未检测到任何已知工具标记；可指定：npx jevzh doctor --tool claude');
+    return 0;
+  }
+
+  let hasBlock = false;
+  let hasWarn = false;
+
+  for (const target of pool) {
+    const plan = preflightTarget(target, baseDir, isGlobal, { noJev: !!opts.noJev });
+    plans.push(plan);
+    console.log(`  ── ${target.name} ──`);
+
+    for (const b of plan.blocks) {
+      if (b.kind === 'plugin') {
+        hasBlock = true;
+        console.log(`  [BLOCK] 竞品插件启用记录：${b.file} -> ${b.name}`);
+        console.log(`          请先在宿主内卸载/禁用该插件（例如 Claude Code 会话内执行：/plugin uninstall ${b.name.split('（')[0]}；`
+          + 'Cursor 在扩展/MCP 管理页禁用），再重跑 npx jevzh。');
+      }
+      if (b.kind === 'settings-corrupt') {
+        // doctor 分级：插件启用才是 exit 2；坏 JSON 是可修复的安装阻断项，exit 1。
+        hasWarn = true;
+        console.log(`  [问题] hooks 设置文件损坏：${b.file} 不是合法 JSON（安装时该目标会 BLOCK 不写盘）`);
+        console.log(`          修复 JSON 后重跑 npx jevzh --tool ${shortestAlias(target.name) || 'claude'}（安装器会读改写合并，绝不静默覆盖）。`);
+      }
+    }
+    for (const e of plan.errors) {
+      if (e.kind === 'link-container') {
+        hasWarn = true;
+        console.log(`  [WARN] 技能容器是符号链接/junction：${e.path}（防穿越，安装器不会写入）`);
+      }
+    }
+
+    // 技能来源与完整性
+    const relDir = isGlobal ? globalRelDir(target) : target.dir;
+    const skillsDir = relDir ? resolve(baseDir, relDir) : null;
+    if (skillsDir && existsSync(skillsDir)) {
+      let oursCount = 0;
+      for (const name of listSourceSkillNames()) {
+        const d = resolve(skillsDir, name);
+        if (!existsSync(d)) continue;
+        const c = classifySkillSource(d);
+        if (c.source === 'ours') {
+          oursCount++;
+          const body = readSkillBody(d);
+          if (!body || body.trim() === '') {
+            hasWarn = true;
+            console.log(`  [WARN] 本包技能 ${name} 不完整：SKILL.md 缺失/为空（meta 与文件不符）`);
+            console.log(`          修复：npx jevzh --tool ${shortestAlias(target.name) || 'claude'}（预检会判定自升级并修复重装）`);
+          } else if (c.version && compareVersions(c.version, PKG.version) < 0) {
+            hasWarn = true;
+            console.log(`  [WARN] 本包技能 ${name} 版本陈旧：v${c.version} < v${PKG.version}，建议 npx jevzh 重跑自升级`);
+          }
+        } else if (c.source === 'zh' || c.source === 'jev' || c.source === 'obra') {
+          hasWarn = true;
+          console.log(`  [SKIP 残留] ${name}：来源 ${sourceLabel(c.source)}（未接管；--adopt-skills 可备份后接管）`);
+        } else if (c.source === 'unknown') {
+          let st;
+          try { st = lstatSync(d); } catch { st = null; }
+          if (st && st.isDirectory() && !st.isSymbolicLink() && readdirSync(d).length > 0) {
+            hasWarn = true;
+            console.log(`  [SKIP 残留] ${name}：来源不明的同名目录（最保守保留；确认可替换用 --adopt-skills）`);
+          }
+        }
+      }
+      if (oursCount > 0) console.log(`  [OK]   本管技能 ${oursCount} 个，归属：jev-superpowers-zh -> ${relDir}`);
+    }
+
+    // router 归属（含悬空 R8）
+    const desc = routerDescriptor(target, isGlobal);
+    if (desc) {
+      for (const rel of desc.shared || []) {
+        const abs = resolve(baseDir, rel);
+        if (!existsSync(abs)) continue;
+        const st = analyzeRouterText(readFileSync(abs, 'utf8'));
+        if (st.danglingOurs || st.danglingZh) {
+          hasWarn = true;
+          console.log(`  [WARN] router 文件 ${rel}：存在悬空哨兵（begin 有、end 缺/不配对），安装器不会接管该文件`);
+          console.log('          请手工补齐/删除成对标记后重跑 npx jevzh；卸载切除同样会跳过畸形文件。');
+        } else if (st.oursTargets.length) {
+          console.log(`  [OK]   router 归属 jev-superpowers-zh：${rel}（target 区块：${st.oursTargets.join('、') || '未标注'}）`);
+        }
+        if (st.hasCompetitor && !st.danglingOurs && !st.danglingZh) {
+          hasWarn = true;
+          console.log(`  [SKIP 残留] router 文件 ${rel}：仍含竞品引导段（superpowers-zh/jev/obra）`);
+          console.log(`          接管：npx jevzh --tool ${shortestAlias(target.name) || 'claude'}（备份后切除，用户内容保留）；保留现状加 --keep-router`);
+        }
+      }
+      for (const s of desc.standalone || []) {
+        if (existsSync(resolve(baseDir, s.legacyRel))) {
+          hasWarn = true;
+          console.log(`  [SKIP 残留] 旧规则文件 ${s.legacyRel}（重跑安装可备份后移除；--keep-router 保留）`);
+        }
+        if (existsSync(resolve(baseDir, s.oursRel))) {
+          console.log(`  [OK]   router 归属 jev-superpowers-zh：${s.oursRel}`);
+        }
+      }
+    }
+
+    // hooks：运行时 + 配置合法性/合并状态
+    if (target.hooks && !opts.noJev) {
+      const hookDest = resolve(baseDir, target.hooks);
+      if (existsSync(hookDest)) {
+        const present = hookRuntimeFiles(target).filter(f => existsSync(resolve(hookDest, f)));
+        console.log(`  [OK]   hooks 运行时：${target.hooks}（${present.length}/${hookRuntimeFiles(target).length} 个文件）`);
+      }
+      for (const host of settingsHostsForTarget(target)) {
+        for (const rel of host.candidates) {
+          const abs = resolve(baseDir, rel);
+          if (!existsSync(abs)) continue;
+          try {
+            const cfg = JSON.parse(readFileSync(abs, 'utf8'));
+            const wired = wiredEvents(cfg, host.schema);
+            if (wired.size === HOOK_EVENTS.length) {
+              console.log(`  [OK]   hooks 已接线：${rel}（session-start/pre-commit/stop 三类事件齐全）`);
+            } else {
+              hasWarn = true;
+              console.log(`  [WARN] hooks 未完全接线：${rel}（已接：${[...wired].join(',') || '无'}），重跑 npx jevzh 自动合并`);
+            }
+          } catch {
+            hasWarn = true;
+            console.log(`  [问题] ${rel} JSON 不合法（安装时该目标会因此 BLOCK，避免覆盖你的配置）：修复后重跑 npx jevzh`);
+          }
+        }
+      }
+    }
+  }
+
+  // 就绪四态（spawn bash 仓内 scripts/jev-readiness --json；bash 缺失优雅降级 Node 版）
+  if (!opts.noJev) {
+    const r = await probeReadiness(baseDir, isGlobal, !!opts.strict);
+    console.log(`  ── 门禁就绪（${r.source}）──`);
+    console.log(`  状态：${r.data.state}；后端：${r.data.backend}；strict=${r.data.strict ? 'true' : 'false'}`);
+    const missing = r.data.missingTools || [];
+    if (missing.length) console.log(`  缺失门禁工具：${missing.join(', ')}（软降级；各门独立转标准中文技能）`);
+    else console.log('  门禁工具：6/6 就绪');
+  }
+
+  // 备份清单
+  const bkRoot = backupsRootFor(baseDir);
+  let bks = [];
+  try {
+    bks = readdirSync(bkRoot, { withFileTypes: true })
+      .filter(e => e.isDirectory() && BACKUP_TS_RE.test(e.name))
+      .map(e => e.name).sort();
+  } catch {}
+  console.log('  ── 备份与恢复 ──');
+  if (!bks.length) {
+    console.log('  暂无接管备份（纯补缺/幂等运行不产生备份）。');
+  } else {
+    for (const ts of bks) {
+      let m = null;
+      try { m = JSON.parse(readFileSync(resolve(bkRoot, ts, 'manifest.json'), 'utf8')); } catch {}
+      const kind = m ? m.kind : '?';
+      const targets = m ? m.targets.map(t => t.target).join(',') : '?';
+      console.log(`  · ${ts}  [${kind}]  targets: ${targets}`);
+    }
+    console.log(`  恢复：npx jevzh restore ${bks[bks.length - 1]}（先列清单：npx jevzh restore --list）`);
+  }
+
+  if (hasBlock) {
+    console.log('\n  doctor 结论：存在 BLOCK 项（见上），必须先处理后才能安装该目标。\n');
+    return 2;
+  }
+  if (hasWarn) {
+    console.log('\n  doctor 结论：存在 WARN/SKIP 残留项（见上），按建议命令处理；不影响现有方法论使用。\n');
+    return 1;
+  }
+  console.log('\n  doctor 结论：已安装目标健康。\n');
+  return 0;
+}
+
+// ===========================================================================
+// restore：离线恢复（恢复前自动再备一份当前状态；不依赖网络）
+// ===========================================================================
+function listBackups(baseDir) {
+  const bkRoot = backupsRootFor(baseDir);
+  let entries;
+  try {
+    entries = readdirSync(bkRoot, { withFileTypes: true })
+      .filter(e => e.isDirectory() && BACKUP_TS_RE.test(e.name))
+      .map(e => e.name).sort();
+  } catch { entries = []; }
+  return entries;
+}
+
+function printBackupList(baseDir) {
+  const bks = listBackups(baseDir);
+  console.log(`\n  备份目录：${backupsRootFor(baseDir)}\n`);
+  if (!bks.length) {
+    console.log('  （暂无备份）');
+    return;
+  }
+  for (const ts of bks) {
+    let m = null;
+    try { m = JSON.parse(readFileSync(resolve(backupsRootFor(baseDir), ts, 'manifest.json'), 'utf8')); } catch {}
+    const kind = m ? m.kind : 'manifest 不可读';
+    const version = m ? m.version : '?';
+    const targets = m ? m.targets.map(t => `${t.target}(${t.entries.length} 项)`).join(', ') : '?';
+    console.log(`  ${ts}  [${kind}] v${version}  ${targets}`);
+  }
+  console.log(`\n  恢复命令：npx jevzh restore <时间戳>`);
+}
+
+function restore(tsArg, opts) {
+  const isGlobal = !!opts.isGlobal;
+  const baseDir = isGlobal ? homedir() : PROJECT_DIR;
+  if (!tsArg || tsArg === '--list') {
+    printBackupList(baseDir);
+    return 0;
+  }
+  if (!BACKUP_TS_RE.test(tsArg)) {
+    console.error(`  ❌ 时间戳格式不合法：${tsArg}（用 npx jevzh restore --list 查看可用备份）`);
+    return 64;
+  }
+  const bkRoot = backupsRootFor(baseDir);
+  const src = resolve(bkRoot, tsArg);
+  if (!existsSync(src)) {
+    console.error(`  ❌ 找不到备份：${src}`);
+    printBackupList(baseDir);
+    return 1;
+  }
+  let manifest;
+  try {
+    manifest = JSON.parse(readFileSync(resolve(src, 'manifest.json'), 'utf8'));
+  } catch (e) {
+    console.error(`  ❌ 备份 manifest 损坏：${e.message}`);
+    return 1;
+  }
+
+  const onlyTarget = opts.toolArg ? (TOOL_ALIASES[String(opts.toolArg).toLowerCase()] || null) : null;
+  const targetGroups = manifest.targets.filter(t => !onlyTarget || t.target === onlyTarget);
+  if (!targetGroups.length) {
+    console.error(`  ❌ 备份 ${tsArg} 中没有目标 ${opts.toolArg || ''} 的条目。`);
+    return 1;
+  }
+
+  // 恢复前再备一份当前状态（pre-restore 安全网，轮转保留最近 3 份）。
+  const safety = createBackupRun(baseDir, isGlobal, 'pre-restore', { restoreOf: tsArg });
+  const entries = [];
+  for (const g of targetGroups) {
+    for (const e of g.entries) {
+      if (!entries.some(x => x.relPath === e.relPath)) entries.push({ ...e, target: g.target });
+    }
+  }
+  for (const e of entries) {
+    if (e.existed) {
+      const abs = restoreEntryAbs(baseDir, e.target, e.relPath);
+      if (existsSync(abs) || lstatSafe(abs)) {
+        // 目录条目必须走 captureDir（captureFile 的 copyFileSync 遇目录会 EPERM/EISDIR）。
+        if (e.kind === 'dir') safety.captureDir(e.target, abs, e.relPath);
+        else safety.captureFile(e.target, abs, e.relPath, true);
+      }
+    }
+  }
+  safety.finalize();
+
+  console.log(`\n  恢复 ${tsArg}（${entries.length} 项；恢复前已再备一份当前状态）→ ${baseDir}\n`);
+  let restored = 0;
+  for (const e of entries) {
+    const abs = restoreEntryAbs(baseDir, e.target, e.relPath);
+    // 越界判定同样按条目根：重定向 dirWin 条目允许落在其文件根内。
+    const entryRoot = (() => {
+      const homeRoot = resolve(baseDir);
+      if (isInsideDir(homeRoot, abs)) return homeRoot;
+      const t = TARGETS.find(x => x.name === e.target);
+      if (t && t.global && process.platform === 'win32' && t.global.dirWin) {
+        const gAbs = globalRelDir(t);
+        if (gAbs && isAbsolute(gAbs)) return resolve(gAbs, '..');
+      }
+      return homeRoot;
+    })();
+    if (!isInsideDir(entryRoot, abs)) {
+      console.warn(`  ⚠️ 跳过越界路径：${e.relPath}`);
+      continue;
+    }
+    let st;
+    try { st = lstatSync(abs); } catch { st = null; }
+    if (st && st.isSymbolicLink()) {
+      console.warn(`  ⚠️ ${e.relPath} 当前是符号链接/junction，保留不恢复（防穿越）。`);
+      continue;
+    }
+    if (e.existed === true) {
+      if (!e.payload) { console.warn(`  ⚠️ 备份缺少载荷：${e.relPath}`); continue; }
+      const payloadAbs = resolve(src, e.payload);
+      if (!existsSync(payloadAbs)) { console.warn(`  ⚠️ 载荷不存在：${e.payload}`); continue; }
+      if (st) {
+        if (st.isDirectory()) rmSync(abs, { recursive: true, force: true });
+        else rmSync(abs, { force: true });
+      }
+      mkdirSync(dirname(abs), { recursive: true });
+      if (e.kind === 'dir') {
+        mkdirSync(abs, { recursive: true });
+        copyDirSync(payloadAbs, abs);
+      } else {
+        copyFileSync(payloadAbs, abs);
+      }
+      console.log(`  ✅ 还原 ${e.relPath}`);
+      restored++;
+    } else {
+      // 安装时新建的文件/目录：恢复即删除
+      if (st) {
+        if (st.isDirectory()) rmSync(abs, { recursive: true, force: true });
+        else rmSync(abs, { force: true });
+        console.log(`  ✅ 删除安装时新建 ${e.relPath}`);
+        restored++;
+      }
+    }
+  }
+  // 修剪清空目录（重定向 dirWin 条目按其文件根向上修剪，不越过该根）
+  for (const e of entries) {
+    const abs = restoreEntryAbs(baseDir, e.target, e.relPath);
+    const root = isInsideDir(baseDir, abs)
+      ? resolve(baseDir)
+      : (() => {
+          const t = TARGETS.find(x => x.name === e.target);
+          if (t && t.global && process.platform === 'win32' && t.global.dirWin) {
+            const gAbs = globalRelDir(t);
+            if (gAbs && isAbsolute(gAbs)) return resolve(gAbs, '..');
+          }
+          return resolve(baseDir);
+        })();
+    let d = dirname(abs);
+    for (let i = 0; i < 8; i++) {
+      if (resolve(d) === root || !isInsideDir(root, d)) break;
+      try {
+        if (existsSync(d) && lstatSync(d).isDirectory() && readdirSync(d).length === 0) {
+          // 已确认空目录；Windows 下 recursive:false 删目录抛 EISDIR。
+          rmSync(d, { recursive: true, force: true });
+        } else break;
+      } catch { break; }
+      d = dirname(d);
+    }
+  }
+  console.log(`\n  恢复完成：${restored} 项。当前状态备份可在不满意时再次 restore。\n`);
+  return 0;
+}
+
+function lstatSafe(p) {
+  try { return lstatSync(p); } catch { return null; }
+}
+
+// ===========================================================================
+// 就绪探测三修（S-10/S-11）：spawn bash 仓内 jev-readiness --json、整体超时、
+// 非 JSON 200 不判 laya、输出 URL 抹除 userinfo。
+// ===========================================================================
+function classifyHealth(health) {
+  if (!health || typeof health !== 'object') return 'none';
+  if (health.laya_installed === true) return 'laya';
+  if (health.laya_installed === false) return 'heuristic';
+  return 'none';
+}
+
+function redactUrl(urlString) {
+  let u;
+  try { u = new URL(urlString); } catch {
+    return String(urlString).replace(/(^[a-z]+:\/\/)[^/@]*@/i, '$1***@');
+  }
+  if (u.username || u.password) {
+    u.username = '***';
+    u.password = '***';
+  }
+  return u.toString();
+}
+
+function readinessScriptPath() {
+  return resolve(__dirname, '..', 'scripts', 'jev-readiness');
+}
+
+// 优先 spawn bash 仓内权威脚本；不可用/超时/输出非法时返回 Node 轻量探测结果。
+async function probeReadiness(baseDir, isGlobal, strict) {
+  const started = Date.now();
+  const fallback = await computeReadinessFallback(baseDir, isGlobal, strict);
+  let bash;
+  try {
+    bash = spawnSync('bash', [readinessScriptPath(), '--project', baseDir, '--json'], {
+      encoding: 'utf8',
+      timeout: 4000,
+      windowsHide: true,
+    });
+  } catch {
+    return { source: 'Node 轻量探测（bash 不可用）', data: fallback };
+  }
+  if (!bash || bash.error || bash.status !== 0 || !bash.stdout) {
+    return { source: 'Node 轻量探测（bash 就绪脚本不可用）', data: fallback };
+  }
+  const lines = bash.stdout.split(/\r?\n/).filter(Boolean);
+  for (let i = lines.length - 1; i >= 0; i--) {
+    try {
+      const j = JSON.parse(lines[i]);
+      if (j && typeof j === 'object' && ['FULL', 'LOCAL', 'PARTIAL', 'DEGRADED'].includes(j.state)) {
+        // 整体超时兜底（脚本理论 4s 上限；防御）
+        if (Date.now() - started > 6000) return { source: 'Node 轻量探测（bash 超时）', data: fallback };
+        return {
+          source: 'scripts/jev-readiness（bash 权威口径）',
+          data: {
+            ...fallback,
+            state: j.state,
+            backend: j.backend || fallback.backend,
+            strict: typeof j.strict === 'boolean' ? j.strict : fallback.strict,
+            missingTools: Array.isArray(j.missingTools) ? j.missingTools : fallback.missingTools,
+          },
+        };
+      }
+    } catch {}
+  }
+  return { source: 'Node 轻量探测（就绪脚本输出无法解析）', data: fallback };
 }
 
 // CLI 工具的可执行文件名 —— 检测落空时扫 PATH 给出针对性建议。
@@ -1159,6 +2850,12 @@ function showHelp() {
     npx jevzh --strict          新生成的 .jevzh.json 默认 strict:true（已存在的配置不覆盖）
     npx jevzh --uninstall       卸载当前目录（加 --global 卸载全局；.jevzh.json 默认保留）
     npx jevzh --force           允许在用户主目录(~)做项目级安装（默认拒绝）
+    npx jevzh --detect-only      只做共存预检并打印五级处置矩阵，绝不写盘（有 BLOCK 时 exit 2）
+    npx jevzh --adopt-skills     备份后接管同名他方技能（superpowers-zh/jev/obra/未知）
+    npx jevzh --keep-router      保留旧发行版引导段/规则文件，不切除不合并 hooks 配置
+    npx jevzh doctor             只读诊断（竞品/归属/SKIP 残留/hooks/就绪/备份）
+    npx jevzh restore --list     列出接管备份（.jevzh/backups/<时间戳>，自动轮转留 3 份）
+    npx jevzh restore <时间戳>   离线恢复（恢复前自动再备一份当前状态）
     npx jevzh --help            显示帮助
     npx jevzh --version         显示版本
 
@@ -1377,13 +3074,29 @@ function cutLegacyZhMarkedSection(content) {
   return { text: content.slice(0, idx) + content.slice(end), cut: true, unresolvable: false };
 }
 
-function cleanBootstrapFile(filePath) {
+// onlyTarget 非空（R-3 单工具卸载）：只切 target 属性匹配的本包区块；
+// 旧无属性本包段/旧 zh 段仅在文件不含其他 target 属性区块时一并清理（见函数内说明）。
+function cleanBootstrapFile(filePath, onlyTarget = null) {
   if (!existsSync(filePath)) return false;
   const original = readFileSync(filePath, 'utf8');
   let text = original;
   let changed = false;
 
-  const ours = cutSentinelPair(text, SENTINEL_BEGIN, SENTINEL_END);
+  // 单目标卸载：先看文件里是否存在「其他 target」的属性化区块。若存在（多 target 共存
+  // 文件，如 S-9 的 AGENTS.md），只精确切除本 target 区块；若不存在，则文件里的无属性
+  // 旧 begin / 旧 zh 哨兵 / 旧标题段都是多 target 化之前的遗物（如 CLAUDE.md 只可能
+  // 属于 Claude），按全量口径一并清理，保持任务 6 的卸载兼容性。
+  let attributedOther = false;
+  if (onlyTarget) {
+    const beginRe = new RegExp(OUR_BEGIN_RE.source, 'g');
+    for (const m of original.matchAll(beginRe)) {
+      const tn = markerTargetName(m[0]);
+      if (tn && tn !== onlyTarget) { attributedOther = true; break; }
+    }
+  }
+  const cutUntargeted = !!onlyTarget && !attributedOther;
+
+  const ours = cutPairedSections(text, OUR_BEGIN_RE, SENTINEL_END, { onlyTarget, cutUntargeted });
   if (ours.malformed) {
     console.warn(`  ⚠️ WARN ${filePath}: jevzh 哨兵标记畸形（begin 重复/嵌套且无法可靠配对），`
       + '为避免误删用户内容已整文件跳过，请手工检查哨兵后重试。');
@@ -1392,23 +3105,25 @@ function cleanBootstrapFile(filePath) {
   text = ours.text;
   changed = changed || ours.cut;
 
-  const legacy = cutSentinelPair(text, ZH_SENTINEL_BEGIN, ZH_SENTINEL_END);
-  if (legacy.malformed) {
-    console.warn(`  ⚠️ WARN ${filePath}: 旧 superpowers-zh 哨兵标记畸形（begin 重复/嵌套且无法可靠配对），`
-      + '为避免误删用户内容已整文件跳过，请手工检查哨兵后重试。');
-    return false;
-  }
-  text = legacy.text;
-  changed = changed || legacy.cut;
+  if (!onlyTarget || cutUntargeted) {
+    const legacy = cutSentinelPair(text, ZH_SENTINEL_BEGIN, ZH_SENTINEL_END);
+    if (legacy.malformed) {
+      console.warn(`  ⚠️ WARN ${filePath}: 旧 superpowers-zh 哨兵标记畸形（begin 重复/嵌套且无法可靠配对），`
+        + '为避免误删用户内容已整文件跳过，请手工检查哨兵后重试。');
+      return false;
+    }
+    text = legacy.text;
+    changed = changed || legacy.cut;
 
-  const marked = cutLegacyZhMarkedSection(text);
-  if (marked.unresolvable) {
-    console.warn(`  ⚠️ WARN ${filePath}: 无法可靠识别旧 superpowers-zh 区段（同名标题但缺少品牌串/尾句等高置信特征，`
-      + '或段尾不可判定），已跳过以避免数据丢失，请手动检查以 "Superpowers-ZH" 开头的整段。');
-    return false;
+    const marked = cutLegacyZhMarkedSection(text);
+    if (marked.unresolvable) {
+      console.warn(`  ⚠️ WARN ${filePath}: 无法可靠识别旧 superpowers-zh 区段（同名标题但缺少品牌串/尾句等高置信特征，`
+        + '或段尾不可判定），已跳过以避免数据丢失，请手动检查以 "Superpowers-ZH" 开头的整段。');
+      return false;
+    }
+    text = marked.text;
+    changed = changed || marked.cut;
   }
-  text = marked.text;
-  changed = changed || marked.cut;
 
   if (!changed) return false;
   writeOrDelete(filePath, text, '');
@@ -1494,13 +3209,15 @@ function uninstallOwnedDir(srcDir, destDir, fileNames, label) {
 
 function uninstallHooksForTarget(target, baseDir) {
   if (!target.hooks) return;
-  uninstallOwnedDir(HOOKS_SRC, resolve(baseDir, target.hooks), HOOK_FILES, `${target.name} hooks`);
+  // R-1：运行时文件按宿主过滤（Claude 不碰 hooks-cursor.json，Cursor 不碰 hooks.json）。
+  const runtimeFiles = hookRuntimeFiles(target).length ? hookRuntimeFiles(target) : HOOK_FILES;
+  uninstallOwnedDir(HOOKS_SRC, resolve(baseDir, target.hooks), runtimeFiles, `${target.name} hooks`);
   uninstallOwnedDir(SCRIPTS_SRC, resolve(baseDir, dirname(target.hooks), 'scripts'), GATE_SCRIPT_FILES, `${target.name} scripts`);
 }
 
-function uninstall(isGlobal, force = false) {
+function uninstall(isGlobal, force = false, toolName = null) {
   const baseDir = isGlobal ? homedir() : PROJECT_DIR;
-  console.log(`\n  jevzh v${PKG.version} — jev-superpowers-zh 卸载（${isGlobal ? '全局' : '项目级'}）\n`);
+  console.log(`\n  jevzh v${PKG.version} — jev-superpowers-zh 卸载（${isGlobal ? '全局' : '项目级'}${toolName ? `；仅 ${toolName}` : '；全部已装目标'}）\n`);
   console.log(`  目标: ${baseDir}\n`);
 
   // I-2：卸载与安装共用同一套家目录/系统目录护栏（此前只在安装侧拦）。
@@ -1542,7 +3259,9 @@ function uninstall(isGlobal, force = false) {
     return 1;
   }
 
-  const pool = isGlobal ? GLOBAL_TARGETS : PROJECT_TARGETS;
+  // R-3：指定 --tool 时只处理该目标；技能/hooks/独立规则/共享区块全部按目标过滤。
+  const scopeTarget = toolName ? TARGETS.find(t => t.name === toolName) : null;
+  const pool = scopeTarget ? [scopeTarget] : (isGlobal ? GLOBAL_TARGETS : PROJECT_TARGETS);
   let totalSkills = 0;
   for (const target of pool) {
     const removed = uninstallSkillsForTarget(target, baseDir, isGlobal);
@@ -1554,7 +3273,8 @@ function uninstall(isGlobal, force = false) {
     uninstallHooksForTarget(target, baseDir);
   }
 
-  // 旧版 .claude/agents 残留（superpowers-zh v1.2.x）
+  // 旧版 .claude/agents 残留（superpowers-zh v1.2.x）：仅全量卸载或 Claude 单工具卸载时处理。
+  if (!scopeTarget || scopeTarget.name === 'Claude Code') {
   const agentsDest = resolve(baseDir, '.claude', 'agents');
   if (existsSync(agentsDest)) {
     let agentsRemoved = 0;
@@ -1579,11 +3299,23 @@ function uninstall(isGlobal, force = false) {
       if (left.length === 0) rmSync(agentsDest, { recursive: true, force: true });
     } catch {}
   }
+  } // if (!scopeTarget || Claude)
 
   let bootstrapsRemoved = 0;
-  const ourDelete = isGlobal ? OUR_BOOTSTRAP_DELETE_GLOBAL : OUR_BOOTSTRAP_DELETE_PROJECT;
-  const legacyDelete = isGlobal ? LEGACY_ZH_BOOTSTRAP_DELETE_GLOBAL : LEGACY_ZH_BOOTSTRAP_DELETE_PROJECT;
-  const cleanList = isGlobal ? BOOTSTRAP_CLEAN_SECTION_GLOBAL : BOOTSTRAP_CLEAN_SECTION_PROJECT;
+  // R-3：单工具卸载时，独立文件名单与共享文件清单都只取该 target 自己的描述符。
+  let ourDelete;
+  let legacyDelete;
+  let cleanList;
+  if (scopeTarget) {
+    const d = routerDescriptor(scopeTarget, isGlobal);
+    ourDelete = d && d.standalone ? d.standalone.map(s => s.oursRel) : [];
+    legacyDelete = d && d.standalone ? d.standalone.map(s => s.legacyRel) : [];
+    cleanList = d && d.shared ? d.shared : [];
+  } else {
+    ourDelete = isGlobal ? OUR_BOOTSTRAP_DELETE_GLOBAL : OUR_BOOTSTRAP_DELETE_PROJECT;
+    legacyDelete = isGlobal ? LEGACY_ZH_BOOTSTRAP_DELETE_GLOBAL : LEGACY_ZH_BOOTSTRAP_DELETE_PROJECT;
+    cleanList = isGlobal ? BOOTSTRAP_CLEAN_SECTION_GLOBAL : BOOTSTRAP_CLEAN_SECTION_PROJECT;
+  }
 
   // S-6：整删名单逐项 lstat —— 只删普通文件/链接本身；条目意外是目录（如用户把
   // .trae/rules/jevzh.md 建成了目录）时 WARN 跳过并继续后续清单，避免 EISDIR 中断，
@@ -1609,8 +3341,8 @@ function uninstall(isGlobal, force = false) {
   }
   for (const rel of cleanList) {
     const full = resolve(baseDir, rel);
-    if (cleanBootstrapFile(full)) {
-      console.log(`  ✅ 清理 bootstrap 区块: ${full}（含本包/旧 superpowers-zh 哨兵段）`);
+    if (cleanBootstrapFile(full, scopeTarget ? scopeTarget.name : null)) {
+      console.log(`  ✅ 清理 bootstrap 区块: ${full}（${scopeTarget ? `仅 ${scopeTarget.name} 本包区块` : '含本包/旧 superpowers-zh 哨兵段'}）`);
       bootstrapsRemoved++;
     }
   }
@@ -1675,7 +3407,9 @@ function httpProbe(urlString, timeoutMs = 2000) {
       res.on('end', () => {
         if (done) return;
         done = true;
-        try { resolve(JSON.parse(body)); } catch { resolve({}); }
+        // S-10：200 但 body 非 JSON（被网关/代理劫持成 HTML 等）不得当作健康证据，
+        // 返回 null 走「无后端」口径，避免误报 Laya/FULL。
+        try { resolve(JSON.parse(body)); } catch { resolve(null); }
       });
     });
     req.on('timeout', () => { req.destroy(); resolve(null); });
@@ -1699,7 +3433,7 @@ function resolveStrict(cfgStrict) {
   return { value: cfgStrict === true, fromEnv: false };
 }
 
-async function readinessReport(baseDir, isGlobal, strict) {
+async function computeReadinessFallback(baseDir, isGlobal, strict) {
   const missing = [];
   for (const t of READY_TOOLS) {
     const ok = t.bin ? isOnPath(t.bin) : gitJevAvailable();
@@ -1732,9 +3466,9 @@ async function readinessReport(baseDir, isGlobal, strict) {
   let backend = 'none';
   if (backendCfg !== 'off') {
     const health = await httpProbeSafe(baseUrl.replace(/\/+$/, '') + '/health');
-    if (health) {
-      backend = health.laya_installed === false ? 'heuristic' : 'laya';
-    }
+    // S-10/S-11：只有 JSON 明确给出 laya_installed 布尔时才下结论；
+    // 非 JSON 200 / 无该字段一律 'none'，绝不误判 laya。
+    backend = classifyHealth(health);
   }
 
   let state;
@@ -1742,6 +3476,22 @@ async function readinessReport(baseDir, isGlobal, strict) {
   else if (missing.length === 0) state = (backend === 'cloud' || backend === 'laya') ? 'FULL' : backend === 'heuristic' ? 'LOCAL' : 'PARTIAL';
   else state = 'PARTIAL';
 
+  return {
+    state,
+    backend,
+    backendCfg,
+    baseUrl,
+    strict: strictState.value,
+    strictFromEnv: strictState.fromEnv,
+    missingTools: missing.map(t => t.name),
+  };
+}
+
+async function readinessReport(baseDir, isGlobal, strict) {
+  // 优先仓内权威脚本 scripts/jev-readiness（spawn bash，整体超时）；
+  // bash 缺失/超时/输出非法时降级到 Node 轻量探测（同口径）。
+  const r = await probeReadiness(baseDir, isGlobal, strict);
+  const d = r.data;
   const stateDesc = {
     FULL: '全量就绪：工具齐 + 云端/Laya 后端可达',
     LOCAL: '本地就绪：工具齐 + 本地 heuristic 桥可达',
@@ -1749,21 +3499,21 @@ async function readinessReport(baseDir, isGlobal, strict) {
     DEGRADED: '已降级：工具全缺或 backend=off，门禁转标准中文技能（方法论仍可独立使用）',
   };
 
-  console.log('\n  ── 门禁就绪检测（与 scripts/jev-readiness 同口径）──');
-  console.log(`  总体状态：${state}（${stateDesc[state]}）`);
+  console.log(`\n  ── 门禁就绪检测（${r.source}）──`);
+  console.log(`  总体状态：${d.state}（${stateDesc[d.state]}）`);
   for (const t of READY_TOOLS) {
-    if (missing.some(m => m.name === t.name)) {
+    if (d.missingTools.includes(t.name)) {
       console.log(`    [缺失] ${t.name.padEnd(9)} 安装：${t.hint}`);
     } else {
       console.log(`    [就绪] ${t.name}`);
     }
   }
-  console.log(`  后端：${backend}（backend=${backendCfg}，baseUrl=${baseUrl}）`);
-  if (strictState.value) {
+  console.log(`  后端：${d.backend}（backend=${d.backendCfg}，baseUrl=${redactUrl(d.baseUrl)}）`);
+  if (d.strict) {
     console.log('  严格模式：开启（strict=true，环境型失败 exit 2'
-      + `${strictState.fromEnv ? '；来自 JEVZH_STRICT 环境变量' : ''}）`);
+      + `${d.strictFromEnv ? '；来自 JEVZH_STRICT 环境变量' : ''}）`);
   } else {
-    console.log(`  严格模式：关闭（软降级；JEVZH_STRICT=1 可开启${strictState.fromEnv ? '；当前值来自 JEVZH_STRICT 环境变量' : ''}）`);
+    console.log(`  严格模式：关闭（软降级；JEVZH_STRICT=1 可开启${d.strictFromEnv ? '；当前值来自 JEVZH_STRICT 环境变量' : ''}）`);
   }
   console.log('  ────────────────────────────────────────────────────');
 }
@@ -1777,7 +3527,11 @@ async function httpProbeSafe(url) {
 }
 
 async function install(forceToolName, opts) {
-  const { force = false, isGlobal = false, noJev = false, strict = false } = opts;
+  const {
+    force = false, isGlobal = false, noJev = false, strict = false,
+    detectOnly = false, adoptSkills = false, keepRouter = false,
+  } = opts;
+  const effOpts = { noJev, strict, detectOnly, adoptSkills, keepRouter };
 
   console.log(`\n  jevzh v${PKG.version} — jev-superpowers-zh：中文超能力 + jev 门禁软降级\n`);
 
@@ -1827,11 +3581,14 @@ async function install(forceToolName, opts) {
   }
 
   console.log(`  源: ${skillCount(noJev)} 个 skills${noJev ? '（--no-jev 纯中文形态，不含 6 个 jev-* 技能）' : '（21 中文 + 6 jev-*）'}`);
-  console.log(`  模式: ${isGlobal ? '全局（所有项目共享，装到用户级目录）' : '项目级'}${noJev ? '；不接线 hooks、不生成 .jevzh.json' : ''}${!noJev && strict ? '；新配置 strict=true' : ''}`);
+  console.log(`  模式: ${isGlobal ? '全局（所有项目共享，装到用户级目录）' : '项目级'}`
+    + `${noJev ? '；不接线 hooks、不生成 .jevzh.json' : ''}${!noJev && strict ? '；新配置 strict=true' : ''}`
+    + `${detectOnly ? '；--detect-only 只预检不写盘' : ''}${adoptSkills ? '；--adopt-skills 接管同名他方技能' : ''}${keepRouter ? '；--keep-router 保留旧引导' : ''}`);
   console.log(`  目标: ${baseDir}\n`);
 
-  const subOpts = { noJev, strict };
-
+  // 选定目标（自动检测结果必须在任何写盘前一次性算完）。
+  let chosen = [];
+  const pool = isGlobal ? GLOBAL_TARGETS : PROJECT_TARGETS;
   if (forceToolName) {
     const target = TARGETS.find(t => t.name === forceToolName);
     if (!isGlobal && !target.dir) {
@@ -1858,31 +3615,16 @@ ${target.noProjectReason || `        其官方文档只给出用户级技能目�
 `);
       return 64;
     }
-    installForTarget(target, baseDir, isGlobal, subOpts);
-    if (!isGlobal && !noJev) ensureProjectConfig(baseDir, strict);
-    if (!noJev) await readinessReport(baseDir, isGlobal, strict);
-    console.log('\n  安装完成！重启你的 AI 编程工具即可生效。\n');
-    return 0;
-  }
-
-  // 自动检测：检测结果在写盘前一次性算完（避免边装边判互相误触发）。
-  let installed = 0;
-  const pool = isGlobal ? GLOBAL_TARGETS : PROJECT_TARGETS;
-  const detectedBefore = new Map();
-  for (const target of pool) {
-    const dm = isGlobal ? target.global.detect : target.detect;
-    const ds = Array.isArray(dm) ? dm : [dm];
-    detectedBefore.set(target.name, ds.some(d => existsSync(resolve(baseDir, d))));
-  }
-
-  for (const target of pool) {
-    if (detectedBefore.get(target.name)) {
-      installForTarget(target, baseDir, isGlobal, subOpts);
-      installed++;
+    chosen = [target];
+  } else {
+    for (const target of pool) {
+      const dm = isGlobal ? target.global.detect : target.detect;
+      const ds = Array.isArray(dm) ? dm : [dm];
+      if (ds.some(d => existsSync(resolve(baseDir, d)))) chosen.push(target);
     }
   }
 
-  if (installed === 0) {
+  if (chosen.length === 0) {
     const where = isGlobal ? '你的用户主目录(~)' : '当前目录';
     const flag = isGlobal ? '--global ' : '';
     console.log(`  ⚠️  未在${where}检测到任何已知 AI 编程工具的标记。\n`);
@@ -1918,8 +3660,53 @@ ${target.noProjectReason || `        其官方文档只给出用户级技能目�
     return 1;
   }
 
-  if (!isGlobal && !noJev) ensureProjectConfig(baseDir, strict);
-  if (!noJev) await readinessReport(baseDir, isGlobal, strict);
+  // ── 预检（纯只读）：五级处置矩阵 + 插件/坏 JSON/链接容器硬阻断 ──
+  const plans = chosen.map(target => preflightTarget(target, baseDir, isGlobal, effOpts));
+  for (const plan of plans) printPlanMatrix(plan, effOpts);
+
+  const blockedPlans = plans.filter(p => p.blocks.length > 0 || p.errors.length > 0);
+  const blockedNames = new Set(blockedPlans.map(p => p.target.name));
+
+  if (detectOnly) {
+    if (blockedPlans.length > 0) {
+      console.log('\n  --detect-only 结论：存在 BLOCK 项（见上）。解除前安装器不会写任何文件；退出码 2。\n');
+      return 2;
+    }
+    const addN = plans.reduce((n, p) => n + p.skills.filter(s => s.action === 'add').length, 0);
+    console.log(`\n  --detect-only 结论：${plans.length} 个目标可安装（补缺 ${addN} 个技能）；未做任何写盘。\n`);
+    return 0;
+  }
+
+  if (blockedPlans.length > 0) {
+    console.log(`\n  ⛔ ${blockedPlans.length} 个目标被 BLOCK（${[...blockedNames].join('、')}）：`
+      + '插件启用记录/hooks 坏 JSON/链接容器必须先处理（--force 也不绕过）；其余目标继续。\n');
+  }
+
+  // ── 共享备份轮次 + 逐目标事务（失败仅回滚当前目标，不影响其他目标）──
+  const run = createBackupRun(baseDir, isGlobal, 'install');
+  let okCount = 0;
+  let failCount = 0;
+  for (const plan of plans) {
+    if (blockedNames.has(plan.target.name)) continue;
+    const res = await runTargetTransaction(plan, baseDir, effOpts, run);
+    if (res.ok) okCount++;
+    else failCount++;
+  }
+  run.finalize(); // 全部条目均为新建（无破坏性接管）时连备份目录一起不留
+
+  // 所有目标都被 BLOCK/失败时绝不补写 .jevzh.json（BLOCK 要求目标零写盘）。
+  if (!isGlobal && !noJev && okCount > 0) ensureProjectConfig(baseDir, strict);
+  if (!noJev && (okCount > 0 || failCount > 0)) await readinessReport(baseDir, isGlobal, strict);
+
+  if (blockedPlans.length > 0) {
+    console.log(`\n  汇总：${okCount} 个目标完成，${blockedPlans.length} 个 BLOCK 未安装${failCount ? `，${failCount} 个事务失败已回滚` : ''}。`
+      + '请按上方 [BLOCK] 行处理后重跑；退出码 2。\n');
+    return 2;
+  }
+  if (failCount > 0) {
+    console.log(`\n  汇总：${okCount} 个目标完成，${failCount} 个目标失败且已回滚到安装前状态（见 ↩️ 行）；退出码 1。\n`);
+    return 1;
+  }
   console.log('\n  安装完成！重启你的 AI 编程工具即可生效。\n');
   return 0;
 }
@@ -1931,7 +3718,11 @@ const KNOWN_FLAGS = new Set([
   '--help', '-h', '--version', '-v',
   '--uninstall', '-u', '--force', '-f', '--global', '-g', '--tool', '-t',
   '--no-jev', '--strict',
+  // 任务 7 共存处置开关与子命令开关
+  '--detect-only', '--adopt-skills', '--keep-router', '--list',
 ]);
+
+const SUBCOMMANDS = new Set(['doctor', 'restore']);
 
 function parseArgs(argv) {
   const opts = {
@@ -1942,10 +3733,24 @@ function parseArgs(argv) {
     isGlobal: argv.includes('--global') || argv.includes('-g'),
     noJev: argv.includes('--no-jev'),
     strict: argv.includes('--strict'),
+    detectOnly: argv.includes('--detect-only'),
+    adoptSkills: argv.includes('--adopt-skills'),
+    keepRouter: argv.includes('--keep-router'),
+    list: argv.includes('--list'),
   };
   const toolIdx = argv.findIndex(a => a === '--tool' || a === '-t');
   if (toolIdx !== -1) opts.toolArg = argv[toolIdx + 1];
   opts.toolIdx = toolIdx;
+  // 位置参数：doctor / restore [timestamp]（restore 的时间戳不以 - 开头）。
+  const positionals = argv.filter((a, i) => {
+    if (a.startsWith('-')) return false;
+    if (i === toolIdx + 1 && toolIdx !== -1) return false; // --tool 的值
+    return true;
+  });
+  if (positionals.length > 0 && SUBCOMMANDS.has(positionals[0])) {
+    opts.command = positionals[0];
+    if (opts.command === 'restore') opts.restoreTs = positionals[1] || null;
+  }
   return opts;
 }
 
@@ -1975,6 +3780,37 @@ async function main() {
     return 0;
   }
 
+  // 子命令：doctor（只读诊断）/ restore（离线恢复）。
+  if (opts.command === 'doctor') {
+    let toolName = null;
+    if (opts.toolIdx !== -1) {
+      if (!opts.toolArg) {
+        console.error('  ❌ --tool 需要指定工具名，例如: doctor --tool cursor\n');
+        return 64;
+      }
+      toolName = TOOL_ALIASES[opts.toolArg.toLowerCase()];
+      if (!toolName) {
+        console.error(`  ❌ 未知工具: ${opts.toolArg}`);
+        console.error(`  支持的工具: ${Object.keys(TOOL_ALIASES).join(', ')}\n`);
+        return 64;
+      }
+    }
+    return doctor(toolName, opts);
+  }
+  if (opts.command === 'restore') {
+    if (opts.toolIdx !== -1) {
+      if (!opts.toolArg) {
+        console.error('  ❌ --tool 需要指定工具名，例如: restore --tool cursor <时间戳>\n');
+        return 64;
+      }
+      if (!TOOL_ALIASES[opts.toolArg.toLowerCase()]) {
+        console.error(`  ❌ 未知工具: ${opts.toolArg}\n`);
+        return 64;
+      }
+    }
+    return restore(opts.list ? null : opts.restoreTs, opts);
+  }
+
   if (opts.toolIdx !== -1) {
     if (!opts.toolArg) {
       console.error('  ❌ --tool 需要指定工具名，例如: --tool cursor\n');
@@ -1988,13 +3824,13 @@ async function main() {
       return 64;
     }
     if (opts.uninstall) {
-      return uninstall(opts.isGlobal, opts.force);
+      return uninstall(opts.isGlobal, opts.force, toolName);
     }
     return install(toolName, opts);
   }
 
   if (opts.uninstall) {
-    return uninstall(opts.isGlobal, opts.force);
+    return uninstall(opts.isGlobal, opts.force, null);
   }
 
   return install(undefined, opts);
@@ -2026,4 +3862,7 @@ export {
   isSystemDir,
   atomicWriteFileSync,
   strictBoolWord,
+  classifySkillSource,
+  classifyHealth,
+  redactUrl,
 };

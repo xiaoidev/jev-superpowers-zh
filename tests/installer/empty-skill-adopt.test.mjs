@@ -69,7 +69,7 @@ test('R2/b：同名目录内有任意文件（.gitkeep + 用户 SKILL.md）但�
     assert.equal(r.status, 0, r.stdout + r.stderr);
     const out = r.stdout + r.stderr;
     assert.match(out, /WARN/);
-    assert.match(out, /非本包管理/);
+    assert.match(out, /来源不明（用户\/他方内容/);
     assert.doesNotMatch(out, /接管空目录/);
 
     // 用户内容原样，安装器不得写入 meta「漂白」归属。

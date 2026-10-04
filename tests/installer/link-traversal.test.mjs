@@ -42,10 +42,10 @@ test('I-1/1：技能容器是链接时安装失败不写外部；卸载只摘链
     if (!makeDirLinkOrSkip(t, extSkills, linkSkills)) return;
     const extBefore = hashTree(extSkills);
 
-    // 安装：必须失败（非 0）、WARN、外部一字节不动，bootstrap/配置也未生成。
+    // 安装：任务 7 起链接容器硬阻断（exit 2、[BLOCK]），外部一字节不动，bootstrap/配置也未生成。
     const r1 = run(['--tool', 'claude'], { cwd: proj });
     assert.notEqual(r1.status, 0, `安装应失败: ${r1.stdout}${r1.stderr}`);
-    assert.match(r1.stdout + r1.stderr, /WARN/);
+    assert.match(r1.stdout + r1.stderr, /BLOCK/);
     assert.match(r1.stdout + r1.stderr, /符号链接|junction/);
     assert.equal(hashTree(extSkills), extBefore, '安装写入了链接目标（外部目录被污染）');
     assert.deepEqual(listFiles(extSkills), ['EXTERNAL-MARKER.txt', 'brainstorming/SKILL.md']);

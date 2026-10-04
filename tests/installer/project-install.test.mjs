@@ -9,9 +9,9 @@ import {
   SKILLS_SRC, ALL_SKILLS, JEV_SKILLS, ZH_SKILLS, readMeta,
 } from './helpers.mjs';
 
-const HOOK_RUNTIME = [
-  'hooks.json', 'hooks-cursor.json', 'session-start', 'pre-commit', 'stop', 'run-hook.cmd',
-];
+// R-1：hooks 运行时按宿主过滤，两套 schema 文件各归其主
+const CLAUDE_HOOK_RUNTIME = ['hooks.json', 'session-start', 'pre-commit', 'stop', 'run-hook.cmd'];
+const CURSOR_HOOK_RUNTIME = ['hooks-cursor.json', 'session-start', 'pre-commit', 'stop', 'run-hook.cmd'];
 const GATE_SCRIPTS = ['jev-readiness', 'jev-gate', 'serve-laya.py'];
 
 test('Claude Code 项目级默认安装：27 技能 + 嵌套文件 + 哨兵 + hooks + 配置', () => {
@@ -69,9 +69,11 @@ test('Claude Code 项目级默认安装：27 技能 + 嵌套文件 + 哨兵 + ho
     assert.match(claudeMd.slice(bi, ei), /27 个 skills/);
 
     // hooks 运行时按能力落到 .claude/hooks，门禁脚本落到 .claude/scripts
-    for (const f of HOOK_RUNTIME) {
+    for (const f of CLAUDE_HOOK_RUNTIME) {
       assert.ok(exists(path.join(dir, '.claude', 'hooks', f)), `缺少 hooks/${f}`);
     }
+    // R-1：Claude 宿主不得落 Cursor schema 文件
+    assert.ok(!exists(path.join(dir, '.claude', 'hooks', 'hooks-cursor.json')), 'Claude 不应落 hooks-cursor.json');
     for (const f of GATE_SCRIPTS) {
       assert.ok(exists(path.join(dir, '.claude', 'scripts', f)), `缺少 scripts/${f}`);
     }
@@ -92,9 +94,11 @@ test('Cursor 项目级安装：27 技能 + .cursor/hooks 落位', () => {
     assert.equal(r.status, 0, r.stdout + r.stderr);
     const skillsDir = path.join(dir, '.cursor', 'skills');
     assert.equal(fs.readdirSync(skillsDir, { withFileTypes: true }).filter((e) => e.isDirectory()).length, 27);
-    for (const f of HOOK_RUNTIME) {
+    for (const f of CURSOR_HOOK_RUNTIME) {
       assert.ok(exists(path.join(dir, '.cursor', 'hooks', f)), `缺少 .cursor/hooks/${f}`);
     }
+    // R-1：Cursor 宿主不得落 Claude schema 文件
+    assert.ok(!exists(path.join(dir, '.cursor', 'hooks', 'hooks.json')), 'Cursor 不应落 hooks.json');
     for (const f of GATE_SCRIPTS) {
       assert.ok(exists(path.join(dir, '.cursor', 'scripts', f)), `缺少 .cursor/scripts/${f}`);
     }
