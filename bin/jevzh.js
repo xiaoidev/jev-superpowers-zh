@@ -1437,14 +1437,26 @@ function cutForeignMarkedSections(content) {
     const hits = FOREIGN_SECTION_FEATURES.filter(f => section.includes(f)).length;
     if (hits < 2) return { text: content, cut: false, unresolvable: true };
   }
-  let text = content;
-  let cut = false;
-  // 区间按标题嵌套关系必然互斥或包含；从后往前切下标不失效。
-  for (let i = ranges.length - 1; i >= 0; i--) {
-    text = text.slice(0, ranges[i].start) + text.slice(ranges[i].end);
-    cut = true;
+  // 候选区间可能【嵌套包含】（如 ## Superpowers (obra) 内含
+  // ### Superpowers 失败模式清单，且各自 hits>=2）：所有区间都在原始文本上
+  // 独立计算，直接从后往前按原始下标切时，切掉内层后文本已变短，外层仍按旧
+  // end 切片会多删恰好一个内层长度的字节——竞品段之后的用户章节被静默吞掉
+  //（rc=0、无 WARN，I-1′）。先按 start 排序并合并重叠/包含区间（union：
+  // next.start <= cur.end 则 end=max(end)）。由标题层级结构，区间只可能互斥、
+  // 接壤或包含；接壤区间（r1.end===r2.start）合并后切除的文本与逐段切除逐字节
+  // 一致，不改变现有行为。合并后区间天然互斥，从后往前切下标才不会失效。
+  const sorted = ranges.slice().sort((a, b) => a.start - b.start || b.end - a.end);
+  const merged = [];
+  for (const r of sorted) {
+    const last = merged[merged.length - 1];
+    if (last && r.start <= last.end) last.end = Math.max(last.end, r.end);
+    else merged.push({ start: r.start, end: r.end });
   }
-  return { text, cut, unresolvable: false };
+  let text = content;
+  for (let i = merged.length - 1; i >= 0; i--) {
+    text = text.slice(0, merged[i].start) + text.slice(merged[i].end);
+  }
+  return { text, cut: merged.length > 0, unresolvable: false };
 }
 
 // --- hooks 运行时（R-1：按宿主过滤；Claude 不落 hooks-cursor.json，反之亦然）---
@@ -2000,6 +2012,35 @@ function listPayloadFiles(payloadAbs) {
   };
   walk(payloadAbs, '');
   return out.sort();
+}
+
+// 预演专用目录载荷枚举（lstat，任何条目都不跳过）：
+//   files  —— 常规文件相对路径（正斜杠、字典序）；
+//   links  —— 符号链接/junction（Windows junction 在 lstat 下也报告为 symlink）；
+//   others —— 既不是常规文件/目录也不是链接的异常条目。
+// 备份创建用的 listPayloadFiles 会忽略链接，但 copyDirSync 恢复时会【解引用】
+// 复制链接目标——载荷内混入链接可能把备份目录之外的内容带进恢复目标（R-2a）。
+// readdir/lstat 失败（EPERM/占用等）直接抛出，由 restore 预演异常口径处理（R-2b）。
+function inspectPayloadDir(payloadAbs) {
+  const files = [];
+  const links = [];
+  const others = [];
+  const walk = (d, rel) => {
+    for (const ent of readdirSync(d, { withFileTypes: true })) {
+      const r = rel ? `${rel}/${ent.name}` : ent.name;
+      const p = resolve(d, ent.name);
+      const st = lstatSync(p);
+      if (st.isSymbolicLink()) links.push(r);
+      else if (st.isDirectory()) walk(p, r);
+      else if (st.isFile()) files.push(r);
+      else others.push(r);
+    }
+  };
+  walk(payloadAbs, '');
+  files.sort();
+  links.sort();
+  others.sort();
+  return { files, links, others };
 }
 
 function createBackupRun(baseDir, isGlobal, kind = 'install', extra = {}) {
@@ -2802,8 +2843,26 @@ function verifyBackupPayloads(src, entries) {
     if (e.kind === 'dir') {
       if (!st.isDirectory()) { failures.push({ relPath, reason: `载荷类型不符：${e.payload} 不是目录` }); continue; }
       if (Array.isArray(e.files)) {
-        const missing = e.files.find(f => !existsSync(resolve(payloadAbs, f)));
-        if (missing) failures.push({ relPath, reason: `目录载荷不完整，缺少：${e.payload}/${missing}` });
+        // R-2a：实际枚举（lstat，含符号链接）与 manifest files 必须【精确一致】。
+        // 只查缺失查不出被人塞进载荷的多余文件；copyDirSync 会解引用复制链接，
+        // 可能把备份目录外内容带进恢复目标。任何一类不符都随整体预演失败中止。
+        const actual = inspectPayloadDir(payloadAbs);
+        let bad = null;
+        if (actual.links.length) bad = { rel: actual.links[0], type: '符号链接/junction（恢复会解引用复制，可把备份目录外内容带入恢复目标）' };
+        else if (actual.others.length) bad = { rel: actual.others[0], type: '非常规文件系统条目（既不是文件也不是目录）' };
+        else {
+          const declared = new Set(e.files);
+          const extra = actual.files.find(f => !declared.has(f));
+          const missing = e.files.find(f => !actual.files.includes(f));
+          if (extra) bad = { rel: extra, type: '多余文件（manifest 清单未声明）' };
+          else if (missing) bad = { rel: missing, type: '缺失文件（manifest 声明但载荷内不存在）' };
+        }
+        if (bad) {
+          failures.push({
+            relPath,
+            reason: `目录载荷与 manifest 清单不精确一致：${e.payload}/${bad.rel}（${bad.type}）`,
+          });
+        }
       }
       continue;
     }
@@ -2910,7 +2969,20 @@ function restore(tsArg, opts) {
   }
 
   // ── 预演校验（任何删除/自动备份之前；只读备份目录，活文件零触碰）──
-  const verify = verifyBackupPayloads(src, entries);
+  // R-2b：载荷不可读/不可枚举（EPERM、杀软独占占用等）时 verify 会直接抛异常；
+  // restore 命令必须按「恢复」口径报告，不能让 main 兜底成「安装失败」。
+  let verify;
+  try {
+    verify = verifyBackupPayloads(src, entries);
+  } catch (err) {
+    const reason = err && err.message ? err.message : String(err);
+    console.error(`  ❌ 恢复预演失败：无法读取或枚举备份载荷：${src}`);
+    console.error(`     原因：${reason}`);
+    console.error('     恢复已整体中止：未删除/覆盖任何活文件（也未创建 pre-restore 备份）。'
+      + '请检查备份目录/载荷的读取权限、磁盘状态或是否被其他程序独占占用后重试：'
+      + 'npx jevzh restore --list');
+    return 1;
+  }
   if (verify.legacyWeak) {
     console.warn('  ⚠️ WARN 旧备份无完整性哈希（sha256），仅做弱校验（size 核对 + JSON 目标可解析）；'
       + '弱校验无法识别同尺寸篡改。');
@@ -2951,60 +3023,84 @@ function restore(tsArg, opts) {
 
   console.log(`\n  恢复 ${tsArg}（${entries.length} 项；恢复前已再备一份当前状态）→ ${baseDir}\n`);
   let restored = 0;
-  for (const e of entries) {
-    const abs = absFor(e);
-    const entryRoot = entryRootFor(abs, e);
-    if (!isInsideDir(entryRoot, abs)) {
-      console.warn(`  ⚠️ 跳过越界路径：${e.relPath}`);
-      continue;
-    }
-    let st;
-    try { st = lstatSync(abs); } catch { st = null; }
-    if (st && st.isSymbolicLink()) {
-      console.warn(`  ⚠️ ${e.relPath} 当前是符号链接/junction，保留不恢复（防穿越）。`);
-      continue;
-    }
-    if (e.existed === true) {
-      const payloadAbs = resolve(src, e.payload);
-      if (e.kind === 'dir') {
-        if (st) rmSync(abs, { recursive: true, force: true });
-        mkdirSync(abs, { recursive: true });
-        copyDirSync(payloadAbs, abs);
-      } else {
-        // 先在内存读入已通过预演校验的载荷，原子 rename 覆盖活文件，
-        // 避免「先删后拷」窗口被中断留下半截文件。
-        const buf = readFileSync(payloadAbs);
-        mkdirSync(dirname(abs), { recursive: true });
-        if (st && st.isDirectory()) rmSync(abs, { recursive: true, force: true });
-        atomicWriteFileSync(abs, buf);
+  // R-2c：写入阶段整体兜底。任一条目写失败（只读 EPERM、占用、磁盘满等）都在
+  // 此转成 restore 口径中文报告：指出失败条目、给出 pre-restore 回退点，并如实
+  // 说明目录恢复「先 rm 后 copy」非原子、当前可能为部分恢复状态。
+  try {
+    for (const e of entries) {
+      const abs = absFor(e);
+      const entryRoot = entryRootFor(abs, e);
+      if (!isInsideDir(entryRoot, abs)) {
+        console.warn(`  ⚠️ 跳过越界路径：${e.relPath}`);
+        continue;
       }
-      console.log(`  ✅ 还原 ${e.relPath}`);
-      restored++;
-    } else {
-      // 安装时新建的文件/目录：恢复即删除
-      if (st) {
-        if (st.isDirectory()) rmSync(abs, { recursive: true, force: true });
-        else rmSync(abs, { force: true });
-        console.log(`  ✅ 删除安装时新建 ${e.relPath}`);
-        restored++;
+      let st;
+      try { st = lstatSync(abs); } catch { st = null; }
+      if (st && st.isSymbolicLink()) {
+        console.warn(`  ⚠️ ${e.relPath} 当前是符号链接/junction，保留不恢复（防穿越）。`);
+        continue;
       }
-    }
-  }
-  // 修剪清空目录（重定向 dirWin 条目按其文件根向上修剪，不越过该根）
-  for (const e of entries) {
-    const abs = absFor(e);
-    const root = entryRootFor(abs, e);
-    let d = dirname(abs);
-    for (let i = 0; i < 8; i++) {
-      if (resolve(d) === root || !isInsideDir(root, d)) break;
       try {
-        if (existsSync(d) && lstatSync(d).isDirectory() && readdirSync(d).length === 0) {
-          // 已确认空目录；Windows 下 recursive:false 删目录抛 EISDIR。
-          rmSync(d, { recursive: true, force: true });
-        } else break;
-      } catch { break; }
-      d = dirname(d);
+        if (e.existed === true) {
+          const payloadAbs = resolve(src, e.payload);
+          if (e.kind === 'dir') {
+            if (st) rmSync(abs, { recursive: true, force: true });
+            mkdirSync(abs, { recursive: true });
+            copyDirSync(payloadAbs, abs);
+          } else {
+            // 先在内存读入已通过预演校验的载荷，原子 rename 覆盖活文件，
+            // 避免「先删后拷」窗口被中断留下半截文件。
+            const buf = readFileSync(payloadAbs);
+            mkdirSync(dirname(abs), { recursive: true });
+            if (st && st.isDirectory()) rmSync(abs, { recursive: true, force: true });
+            atomicWriteFileSync(abs, buf);
+          }
+          console.log(`  ✅ 还原 ${e.relPath}`);
+          restored++;
+        } else {
+          // 安装时新建的文件/目录：恢复即删除
+          if (st) {
+            if (st.isDirectory()) rmSync(abs, { recursive: true, force: true });
+            else rmSync(abs, { force: true });
+            console.log(`  ✅ 删除安装时新建 ${e.relPath}`);
+            restored++;
+          }
+        }
+      } catch (err) {
+        err.entryRel = e.relPath;
+        throw err;
+      }
     }
+    // 修剪清空目录（重定向 dirWin 条目按其文件根向上修剪，不越过该根）
+    for (const e of entries) {
+      const abs = absFor(e);
+      const root = entryRootFor(abs, e);
+      let d = dirname(abs);
+      for (let i = 0; i < 8; i++) {
+        if (resolve(d) === root || !isInsideDir(root, d)) break;
+        try {
+          if (existsSync(d) && lstatSync(d).isDirectory() && readdirSync(d).length === 0) {
+            // 已确认空目录；Windows 下 recursive:false 删目录抛 EISDIR。
+            rmSync(d, { recursive: true, force: true });
+          } else break;
+        } catch { break; }
+        d = dirname(d);
+      }
+    }
+  } catch (err) {
+    const where = err.entryRel ? `条目 ${err.entryRel}` : '写入阶段';
+    const reason = err && err.message ? err.message : String(err);
+    console.error(`\n  ❌ 恢复写入失败（${where}）：${reason}`);
+    console.error('     当前可能处于【部分恢复】状态：文件条目为原子写入（失败不会留下半截文件），'
+      + '但目录条目采用「先 rm 删除整目录、再 copy 复制」的非原子过程，中途失败可能留下'
+      + '已清空或不完整的目录；后续条目尚未处理。');
+    if (safetyTs) {
+      console.error('     恢复前的当前状态已自动备份；修好权限/占用/磁盘问题后，可用下面的时间戳'
+        + `回到恢复前状态：npx jevzh restore ${safetyTs}\n`);
+    } else {
+      console.error('     注意：pre-restore 安全网未成功建立，无法自动回退，请手工检查上述条目。\n');
+    }
+    return 1;
   }
 
   // ── 写后复核：活文件必须与备份声明一致；不符 rc=1 并指向 pre-restore 回退 ──
