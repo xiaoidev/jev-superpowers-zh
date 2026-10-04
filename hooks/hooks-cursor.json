@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "./hooks/run-hook.cmd session-start"
+      }
+    ],
+    "preToolUse": [
+      {
+        "matcher": "Bash",
+        "command": "./hooks/pre-commit"
+      }
+    ],
+    "stop": [
+      {
+        "command": "./hooks/stop"
+      }
+    ]
+  }
+}

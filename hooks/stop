@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Stop-hook verification gate — jev-superpowers-zh 软降级版
+#
+# 三段检查：
+#   1. 工作区有未提交变更（git status --porcelain 非空）
+#   2. ./scripts/test.sh 存在且执行失败
+#   3. limpet 收束门（经 scripts/jev-gate limpet）
+# 前两段仅在 git 仓库内执行，属环境/执行状态：strict 中文 stderr + exit 2，
+# soft 降级为 WARN + 继续。limpet 门始终执行：判定型否决（limpet 可用但结论
+# 否决）即使 soft 也 exit 2；limpet 环境缺失时由 jev-gate 按 strict/soft 分流。
+# strict/soft 读就绪缓存（--cached，stop 频繁触发）；解析失败按 soft——
+# fail-open 仅适用于前两段本地状态检查，limpet 门由 jev-gate 自行判定。
+# 依据：spec §5.4、§4.3。
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_DIR="${PWD:-.}"
+
+state_json="$(bash "$PLUGIN_ROOT/scripts/jev-readiness" --project "$PROJECT_DIR" --json --cached 2>/dev/null || true)"
+STRICT="$(printf '%s' "$state_json" | node -e '
+  let s="";
+  process.stdin.on("data", d => s += d);
+  process.stdin.on("end", () => {
+    try { process.stdout.write(JSON.parse(s).strict === true ? "1" : "0"); }
+    catch (e) { process.stdout.write("0"); }
+  });
+' 2>/dev/null || true)"
+[ "$STRICT" = "1" ] || STRICT=0
+
+IN_REPO=0
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    IN_REPO=1
+fi
+
+# 本地状态类检查：strict 阻断 / soft WARN 后继续
+block_or_warn() { # $1=中文说明
+    if [ "$STRICT" = "1" ]; then
+        echo "stop：$1（严格模式，exit 2）。" >&2
+        exit 2
+    fi
+    echo "WARN stop：$1（软降级放行，不代表检查通过）。" >&2
+}
+
+if [ "$IN_REPO" = "1" ]; then
+    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+        block_or_warn "工作区仍有未提交变更，请先提交或 stash 后再结束"
+    fi
+
+    if [ -f "./scripts/test.sh" ]; then
+        if ! bash ./scripts/test.sh >/dev/null 2>&1; then
+            block_or_warn "./scripts/test.sh 执行失败，请先修复后再结束"
+        fi
+    fi
+fi
+
+# limpet 收束门：经 jev-gate 执行。判定否决（含 soft）一律 exit 2；
+# 环境缺失 soft 时 jev-gate 已打印 [门禁降级] 并 exit 0。
+out="$(bash "$PLUGIN_ROOT/scripts/jev-gate" --project "$PROJECT_DIR" limpet 2>&1)"
+rc=$?
+printf '%s\n' "$out"
+
+if [ "$rc" -ne 0 ]; then
+    echo "stop：limpet 收束门禁未通过（exit 2），结束被阻止；详见上方 jev-gate 输出。" >&2
+    exit 2
+fi
+
+exit 0

@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# PreToolUse gate for git commit / git push — jev-superpowers-zh 软降级版
+#
+# 读取 stdin 的 Claude Code hook JSON：命令字段非 *git*commit*/*git*push* 一律
+# exit 0；无 stdin 时回落门禁（与上游一致）。命中提交命令后经统一入口
+# scripts/jev-gate commit 执行 git jev check：
+#   - 环境型失败（工具缺失/后端不可达/git 缺失）：soft 中文 WARN 后 exit 0，
+#     strict exit 2；
+#   - 判定型失败（输出无 [PASS]）：jev-gate exit 2，任何模式都不软放行。
+# 依据：spec §5.4、§4.3（两类失败不可混淆）。
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_DIR="${PWD:-.}"
+
+input="$(cat 2>/dev/null || true)"
+if [ -n "$input" ]; then
+    cmd="$(printf '%s' "$input" | grep -o '"command"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 || true)"
+    case "$cmd" in
+        *git*commit*|*git*push*) ;;
+        *) exit 0 ;;
+    esac
+fi
+
+# 实探就绪 state 并返回是否严格模式（env > .jevzh.json > 默认；解析失败按
+# soft）；实探会同时刷新就绪缓存，供下方 jev-gate --cached 复用。
+strict_mode() {
+    local flag
+    flag="$(bash "$PLUGIN_ROOT/scripts/jev-readiness" --project "$PROJECT_DIR" --json 2>/dev/null \
+        | node -e '
+      let s="";
+      process.stdin.on("data", d => s += d);
+      process.stdin.on("end", () => {
+        try { process.stdout.write(JSON.parse(s).strict === true ? "1" : "0"); }
+        catch (e) { process.stdout.write("0"); }
+      });
+    ' 2>/dev/null || true)"
+    [ "$flag" = "1" ]
+}
+
+# 主路径也必须先实探一次：既决定 git 缺失时的分流，也以本次环境重写缓存，
+# 避免 jev-gate --cached 读到此前 soft 场景留下的旧 strict 值。
+STRICT=0
+if strict_mode; then
+    STRICT=1
+fi
+
+if ! command -v git >/dev/null 2>&1; then
+    if [ "$STRICT" = "1" ]; then
+        echo "pre-commit：未找到 git，严格模式下提交门禁阻断（exit 2）。请先安装 git。" >&2
+        exit 2
+    fi
+    echo "WARN pre-commit：未找到 git，软降级跳过提交门禁（不代表检查通过）。" >&2
+    exit 0
+fi
+
+# 经统一门禁入口执行 git jev check；JEVZH_GATE_CACHE=1 复用 strict_mode 预热的缓存。
+out="$(JEVZH_GATE_CACHE=1 bash "$PLUGIN_ROOT/scripts/jev-gate" --project "$PROJECT_DIR" commit 2>&1)"
+rc=$?
+printf '%s\n' "$out"
+
+if [ "$rc" -ne 0 ]; then
+    echo "pre-commit：提交门禁未通过（exit 2），本次 git commit/push 已被阻止；详见上方 jev-gate 输出。" >&2
+    exit 2
+fi
+
+exit 0
