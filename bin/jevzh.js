@@ -1132,12 +1132,14 @@ const OUR_BOOTSTRAP_DELETE_PROJECT = [
 ];
 const OUR_BOOTSTRAP_DELETE_GLOBAL = ['.qoder/rules/jevzh.md'];
 
-// 旧 superpowers-zh 独立规则文件：卸载时一并清理（迁移支持，spec §7.1）
+// 旧 superpowers-zh 独立规则文件：卸载时一并清理（迁移支持，spec §7.1）。
+// 例外：.agents/rules.md 不在整删名单——它是多发行版共享的通用文件，且本包
+// 安装已改为哨兵追加（见 installAgentsRules）；卸载只走下方 BOOTSTRAP_CLEAN
+// 的哨兵/旧标题切除，用户自有内容必须保留（I-1：整删会误删从未装过 jevzh 的文件）。
 const LEGACY_ZH_BOOTSTRAP_DELETE_PROJECT = [
   '.github/instructions/superpowers-zh.instructions.md',
   '.trae/rules/superpowers-zh.md',
   '.qoder/rules/superpowers-zh.md',
-  '.agents/rules.md',
   '.clinerules/superpowers-zh.md',
   '.kilocode/rules/superpowers-zh.md',
   '.kiro/steering/superpowers-zh.md',

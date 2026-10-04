@@ -143,3 +143,48 @@ test('从未安装过的目录执行卸载退出码 0', () => {
     rmFixture(dir);
   }
 });
+
+// I-1 回归：.agents/rules.md 是多发行版共享文件，卸载不得整删（曾误删从未装过
+// jevzh 的用户文件）；本包区块只能经哨兵切除，用户内容保留。
+test('I-1：从未安装的项目，用户自有 .agents/rules.md 在卸载后原样保留', () => {
+  const dir = mkFixture('jevzh-un-agents-');
+  const userRules = '# 团队规则\n\n- 这是用户手写内容，与 jevzh 无关。\n';
+  try {
+    fs.mkdirSync(path.join(dir, '.agents'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.agents', 'rules.md'), userRules);
+
+    const r = run(['--uninstall', '--tool', 'antigravity'], { cwd: dir });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    assert.ok(exists(path.join(dir, '.agents', 'rules.md')), '.agents/rules.md 不应被整删');
+    assert.equal(
+      readText(path.join(dir, '.agents', 'rules.md')),
+      userRules.replace(/\r?\n/g, '\n'),
+    );
+  } finally {
+    rmFixture(dir);
+  }
+});
+
+test('I-1：Antigravity 装后卸载仅切除本包哨兵段，.agents/rules.md 用户内容保留', () => {
+  const dir = mkFixture('jevzh-un-agents2-');
+  const userRules = '# 团队规则\n\n- 区块前的用户内容。\n';
+  try {
+    fs.mkdirSync(path.join(dir, '.agents'), { recursive: true });
+    fs.writeFileSync(path.join(dir, '.agents', 'rules.md'), userRules);
+
+    const r1 = run(['--tool', 'antigravity'], { cwd: dir });
+    assert.equal(r1.status, 0, r1.stdout + r1.stderr);
+    const installed = readText(path.join(dir, '.agents', 'rules.md'));
+    assert.match(installed, /jev-superpowers-zh:begin/);
+    assert.match(installed, /团队规则/);
+
+    const r2 = run(['--uninstall', '--tool', 'antigravity'], { cwd: dir });
+    assert.equal(r2.status, 0, r2.stdout + r2.stderr);
+    const after = readText(path.join(dir, '.agents', 'rules.md'));
+    assert.ok(!after.includes('jev-superpowers-zh'), `哨兵残留:\n${after}`);
+    assert.match(after, /团队规则/);
+    assert.match(after, /区块前的用户内容/);
+  } finally {
+    rmFixture(dir);
+  }
+});

@@ -20,6 +20,7 @@
     "hooks/",
     "scripts/",
     "assets/",
+    ".jevzh.json.example",
     ".claude-plugin/",
     ".cursor-plugin/",
     ".codex-plugin/",
