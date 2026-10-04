@@ -136,7 +136,7 @@ grep -q 'laya-heuristic-fallback' "$BRIDGE" \
   && ok '源码含零依赖 heuristic 回退标识' || no '源码缺 heuristic 回退'
 grep -Eq '^(import|from) (argparse|json|math|os|re|sys|http\.server|typing)' "$BRIDGE" \
   && ok '源码 import 仅见标准库模块' || no '源码 import 出现非标准库'
-if grep -Eq '^(import|from) ' "$BRIDGE" | grep -Evq \
+if grep -E '^(import|from) ' "$BRIDGE" | grep -Evq \
   '^(import|from) (argparse|json|math|os|re|sys|http\.server|typing)([. ]|$)'; then
   no '源码存在标准库之外的第三方依赖'
 else
