@@ -263,14 +263,19 @@ MISSING_LIST=""
 
 add_missing() { MISSING_LIST="${MISSING_LIST}${1}"$'\n'; }
 
-if ! command -v jev-axi >/dev/null 2>&1; then add_missing jev-axi; fi
-if ! command -v jev-scout >/dev/null 2>&1; then add_missing jev-scout; fi
-if ! command -v jev-guard >/dev/null 2>&1; then add_missing jev-guard; fi
-if ! git jev --version >/dev/null 2>&1; then add_missing git-jev; fi
-if ! command -v supercov >/dev/null 2>&1; then add_missing supercov; fi
-if ! command -v limpet >/dev/null 2>&1; then add_missing limpet; fi
+# 工具探测惰性化：只在缓存未命中路径调用（见文末 probe_tools 调用点）。
+# --cached 命中时必须零探测，否则缓存既无性能意义，也会被挂死的工具包装卡住。
+probe_tools() {
+  MISSING_LIST=""
+  if ! command -v jev-axi >/dev/null 2>&1; then add_missing jev-axi; fi
+  if ! command -v jev-scout >/dev/null 2>&1; then add_missing jev-scout; fi
+  if ! command -v jev-guard >/dev/null 2>&1; then add_missing jev-guard; fi
+  if ! git jev --version >/dev/null 2>&1; then add_missing git-jev; fi
+  if ! command -v supercov >/dev/null 2>&1; then add_missing supercov; fi
+  if ! command -v limpet >/dev/null 2>&1; then add_missing limpet; fi
 
-MISSING_COUNT=$(printf '%s' "$MISSING_LIST" | grep -c . || true)
+  MISSING_COUNT=$(printf '%s' "$MISSING_LIST" | grep -c . || true)
+}
 
 classify_state() { # $1=backend
   if [ "$BACKEND_CFG" = off ]; then printf 'DEGRADED'; return; fi
@@ -358,8 +363,9 @@ if [ "$USE_CACHED" = 1 ] && [ -f "$STATE_PATH" ] && valid_state_json "$STATE_PAT
 fi
 
 # ---------------------------------------------------------------------------
-# 执行探测并写缓存（notified 继承旧缓存，默认 false）
+# 缓存未命中：执行工具+后端探测并写缓存（notified 继承旧缓存，默认 false）
 # ---------------------------------------------------------------------------
+probe_tools
 BACKEND="$(detect_backend)"
 STATE="$(classify_state "$BACKEND")"
 TS="$(date +%s)"

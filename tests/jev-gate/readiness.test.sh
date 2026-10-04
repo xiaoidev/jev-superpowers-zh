@@ -413,6 +413,31 @@ TS98="$(jget ts <<<"$OUT")"
 rd_run "$P9" --cached
 assert_eq "$(jget ts <<<"$OUT")" "$TS98" "9.8 回退写入的合法 state 可被 --cached 命中（ts 不变）"
 
+# ---------------------------------------------------------------------------
+# 组 10：--cached 命中时不得执行任何工具探测（缓存的性能与防挂起意义）
+# ---------------------------------------------------------------------------
+P10="$TMP/p10"; mkproj "$P10"; putcfg "$P10" '{"backend":"off"}'
+clear_state
+rd_run "$P10"
+TS_FRESH="$(jget ts <<<"$OUT")"
+# 挂死桩：任何对 git 的调用都会睡 30s。--cached 若仍探测 git-jev，本用例必超时失败。
+cat > "$BIN/git" <<'EOF'
+#!/usr/bin/env bash
+sleep 30
+exit 0
+EOF
+chmod +x "$BIN/git"
+T10_0="$(date +%s)"
+rd_run "$P10" --cached
+T10_1="$(date +%s)"
+ELAPSED_10=$((T10_1 - T10_0))
+assert_eq "$(jget ts <<<"$OUT")" "$TS_FRESH" "10.1 --cached 直接返回缓存（ts 不变）"
+if [ "$ELAPSED_10" -lt 10 ]; then
+  ok "10.2 --cached 不触发工具探测（${ELAPSED_10}s < 10s，挂死 git 桩未被调用）"
+else
+  no "10.2 --cached 疑似仍执行探测（耗时 ${ELAPSED_10}s >= 10s）"
+fi
+
 printf '\n==== readiness: PASS=%d FAIL=%d ====\n' "$PASS_COUNT" "$FAIL_COUNT"
 [ "$FAIL_COUNT" -eq 0 ] || exit 1
 exit 0
