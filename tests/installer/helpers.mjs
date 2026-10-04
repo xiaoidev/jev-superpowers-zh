@@ -67,14 +67,16 @@ export function rmFixture(dir) {
   }
 }
 
-// 统一子进程入口：默认清空 JEVZH_*/TYPESAFE_* 继承并把 HOME 指到夹具内，
-// 保证测试不触碰真实环境；伪造 USERPROFILE/APPDATA 的全局测试通过 opts.env 注入。
+// 统一子进程入口：先清空从宿主继承的 JEVZH_*/TYPESAFE_*，再叠加 opts.env，
+// 保证测试不触碰真实环境；opts.env 显式给出的 JEVZH_STRICT 等会保留（用于
+// S-4 环境变量口径测试）。伪造 USERPROFILE/APPDATA 的全局测试通过 opts.env 注入。
 export function run(args, opts = {}) {
-  const env = { ...process.env, ...(opts.env || {}) };
+  const env = { ...process.env };
   delete env.JEVZH_BACKEND;
   delete env.JEVZH_STRICT;
   delete env.TYPESAFE_API_KEY;
   delete env.TYPESAFE_BASE_URL;
+  Object.assign(env, opts.env || {});
   if (!opts.env || !Object.prototype.hasOwnProperty.call(opts.env, 'HOME')) {
     env.HOME = path.join(opts.cwd, 'home');
   }
@@ -84,6 +86,30 @@ export function run(args, opts = {}) {
     env,
     timeout: 90_000,
   });
+}
+
+// 创建「目录 -> 目录」链接：Windows 用 junction（通常无需 SeCreateSymbolicLinkPrivilege），
+// POSIX 用 dir 型符号链接（无需特权）。失败时通过 node:test 上下文 skip 当前用例并返回
+// false——绝不静默假过。target 必须已存在；Windows junction 要求绝对路径。
+export function makeDirLinkOrSkip(t, target, linkPath) {
+  const absTarget = path.resolve(target);
+  const type = process.platform === 'win32' ? 'junction' : 'dir';
+  try {
+    fs.symlinkSync(absTarget, linkPath, type);
+    return true;
+  } catch (err) {
+    t.skip(`当前环境无法创建目录链接（${type}）: ${err.code || ''} ${err.message}`);
+    return false;
+  }
+}
+
+// 只摘链接本身（不递归、不触及链接目标），夹具清理用。
+export function unlinkQuiet(p) {
+  try {
+    fs.rmSync(p, { force: true });
+  } catch {
+    // 忽略：可能已被移除/或为普通空目录递归清理的残留竞争。
+  }
 }
 
 export function readText(file) {

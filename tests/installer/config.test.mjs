@@ -100,3 +100,78 @@ test('幂等重跑不重写 .jevzh.json（mtime/content 稳定）', () => {
     rmFixture(dir);
   }
 });
+
+// S-4：就绪报告严格模式口径 env JEVZH_STRICT > .jevzh.json strict > false，
+// 与 scripts/jev-readiness 的 bool_word 同口径。
+test('S-4：既有 strict:false + JEVZH_STRICT=1 -> 就绪报告显示开启且注明来自环境变量', () => {
+  const dir = mkFixture('jevzh-cfg-strict-env-on-');
+  try {
+    const cfgPath = path.join(dir, '.jevzh.json');
+    fs.writeFileSync(cfgPath, JSON.stringify({ ...DEFAULT_CONFIG, strict: false }, null, 2));
+    const r = run(['--tool', 'claude'], { cwd: dir, env: { JEVZH_STRICT: '1' } });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const out = r.stdout + r.stderr;
+    assert.match(out, /严格模式：开启/);
+    assert.match(out, /来自 JEVZH_STRICT 环境变量/);
+    // 环境变量不改写磁盘配置。
+    assert.equal(JSON.parse(readText(cfgPath)).strict, false);
+  } finally {
+    rmFixture(dir);
+  }
+});
+
+test('S-4：无 env、配置 strict:true -> 报告开启且不声称来自环境变量', () => {
+  const dir = mkFixture('jevzh-cfg-strict-json-on-');
+  try {
+    fs.writeFileSync(
+      path.join(dir, '.jevzh.json'),
+      JSON.stringify({ ...DEFAULT_CONFIG, strict: true }, null, 2),
+    );
+    const r = run(['--tool', 'claude'], { cwd: dir });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const out = r.stdout + r.stderr;
+    assert.match(out, /严格模式：开启/);
+    assert.doesNotMatch(out, /来自 JEVZH_STRICT 环境变量/);
+  } finally {
+    rmFixture(dir);
+  }
+});
+
+test('S-4：JEVZH_STRICT=0 覆盖配置 strict:true（与 jev-readiness 同口径，env 优先级最高）', () => {
+  const dir = mkFixture('jevzh-cfg-strict-env-off-');
+  try {
+    fs.writeFileSync(
+      path.join(dir, '.jevzh.json'),
+      JSON.stringify({ ...DEFAULT_CONFIG, strict: true }, null, 2),
+    );
+    const r = run(['--tool', 'claude'], { cwd: dir, env: { JEVZH_STRICT: '0' } });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const out = r.stdout + r.stderr;
+    assert.match(out, /严格模式：关闭/);
+    assert.match(out, /来自 JEVZH_STRICT 环境变量/);
+  } finally {
+    rmFixture(dir);
+  }
+});
+
+test('S-12：损坏的 .jevzh.json 输出 WARN、安装成功且坏文件字节不变', () => {
+  const dir = mkFixture('jevzh-cfg-broken-');
+  const broken = '{ this is not valid json,,, \n  "strict": true\n';
+  try {
+    const cfgPath = path.join(dir, '.jevzh.json');
+    fs.writeFileSync(cfgPath, broken);
+    const before = fs.readFileSync(cfgPath);
+    const r = run(['--tool', 'claude'], { cwd: dir });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const out = r.stdout + r.stderr;
+    assert.match(out, /WARN/);
+    assert.match(out, /合法 JSON|解析失败/);
+    // 坏文件字节级保留，不被默认配置覆盖。
+    assert.ok(fs.readFileSync(cfgPath).equals(before), '坏 .jevzh.json 被改写');
+    assert.equal(readText(cfgPath), broken.replace(/\r?\n/g, '\n'));
+    // 技能安装不受影响。
+    assert.ok(exists(path.join(dir, '.claude', 'skills', 'jev-verification', 'SKILL.md')));
+  } finally {
+    rmFixture(dir);
+  }
+});

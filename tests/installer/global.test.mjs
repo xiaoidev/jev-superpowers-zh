@@ -119,3 +119,40 @@ test('全局卸载只删本包副本与本哨兵区块，用户自有 skill/内�
     rmFixture(root);
   }
 });
+
+// S-7：APPDATA/LOCALAPPDATA 被重定向到 USERPROFILE 之外（组策略/自定义镜像常见）时，
+// dirWin 目标必须落在重定向目录；USERPROFILE 下不得出现任何污染。
+test('S-7 Windows：APPDATA/LOCALAPPDATA 重定向到 USERPROFILE 之外时全局落位重定向目录', { skip: process.platform !== 'win32' && '仅 Windows 走 APPDATA/LOCALAPPDATA 分支' }, () => {
+  const root = mkFixture('jevzh-global-redirect-');
+  const home = path.join(root, 'home');
+  const roaming = path.join(root, 'redirected', 'Roaming');
+  const local = path.join(root, 'redirected', 'Local');
+  const env = { HOME: home, USERPROFILE: home, APPDATA: roaming, LOCALAPPDATA: local };
+  try {
+    fs.mkdirSync(home, { recursive: true });
+
+    const r1 = run(['--global', '--tool', 'reasonix'], { cwd: root, env });
+    assert.equal(r1.status, 0, r1.stdout + r1.stderr);
+    assert.equal(
+      fs.readdirSync(path.join(roaming, 'reasonix', 'skills'), { withFileTypes: true })
+        .filter((e) => e.isDirectory()).length,
+      27,
+    );
+    // 回退路径（~/AppData）与 POSIX 风格路径都不得出现。
+    assert.ok(!exists(path.join(home, '.reasonix', 'skills')));
+    assert.ok(!exists(path.join(home, 'AppData')));
+    assert.deepEqual(listFiles(home), [], 'USERPROFILE 应零污染');
+
+    const r2 = run(['--global', '--tool', 'crush'], { cwd: root, env });
+    assert.equal(r2.status, 0, r2.stdout + r2.stderr);
+    assert.equal(
+      fs.readdirSync(path.join(local, 'crush', 'skills'), { withFileTypes: true })
+        .filter((e) => e.isDirectory()).length,
+      27,
+    );
+    assert.ok(!exists(path.join(home, '.config', 'crush')));
+    assert.deepEqual(listFiles(home), [], 'USERPROFILE 应零污染');
+  } finally {
+    rmFixture(root);
+  }
+});

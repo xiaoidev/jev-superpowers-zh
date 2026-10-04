@@ -95,3 +95,18 @@ test('--no-jev 不改动已存在的 .jevzh.json', () => {
     rmFixture(dir);
   }
 });
+
+test('S-5：--no-jev --strict 组合不输出“新配置 strict”承诺（本就不生成配置）', () => {
+  const dir = mkFixture('jevzh-nojev-strict-');
+  try {
+    const r = run(['--tool', 'claude', '--no-jev', '--strict'], { cwd: dir });
+    assert.equal(r.status, 0, r.stdout + r.stderr);
+    const out = r.stdout + r.stderr;
+    assert.doesNotMatch(out, /新配置[^\n]*strict/);
+    assert.doesNotMatch(out, /strict=true/);
+    // 仍然明确说明不生成配置。
+    assert.match(out, /不生成 \.jevzh\.json|不接线 hooks/);
+  } finally {
+    rmFixture(dir);
+  }
+});

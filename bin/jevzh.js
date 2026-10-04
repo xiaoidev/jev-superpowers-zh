@@ -23,9 +23,10 @@
 
 import {
   existsSync, mkdirSync, readdirSync, readFileSync, writeFileSync,
-  copyFileSync, lstatSync, realpathSync, rmSync, chmodSync,
+  copyFileSync, lstatSync, realpathSync, rmSync, chmodSync, renameSync,
 } from 'node:fs';
-import { resolve, dirname, join, sep } from 'node:path';
+import { resolve, dirname, join, sep, basename } from 'node:path';
+import { randomBytes } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { homedir, tmpdir } from 'node:os';
 import { spawnSync } from 'node:child_process';
@@ -75,6 +76,27 @@ function copyFileWithMode(srcPath, destPath, srcStat) {
     if (mode) chmodSync(destPath, mode);
   } catch {
     // Windows：chmod 只能切换只读位，可执行位不被文件系统跟踪——忽略。
+  }
+}
+
+// 原子写：同目录 crypto 随机临时文件写完整后 rename 覆盖。零第三方依赖；
+// 任一步失败都清理临时文件并抛出，避免半成品被读者看到或留下 *.tmp 残留。
+// 覆盖既有文件时保留其权限位（POSIX 可执行位等）。
+function atomicWriteFileSync(filePath, data) {
+  const dir = dirname(filePath);
+  const tmp = join(dir, `.${basename(filePath)}.${randomBytes(8).toString('hex')}.tmp`);
+  try {
+    writeFileSync(tmp, data);
+    try {
+      const st = lstatSync(filePath);
+      if (st.isFile()) chmodSync(tmp, st.mode & 0o777);
+    } catch {
+      // 目标原本不存在：沿用进程 umask 下的默认权限即可。
+    }
+    renameSync(tmp, filePath);
+  } catch (err) {
+    try { rmSync(tmp, { force: true }); } catch {}
+    throw err;
   }
 }
 
@@ -150,10 +172,26 @@ const TARGETS = [
 ];
 
 // 全局 skills 目录：少数工具在 Windows 上不走 ~/ 下的同名路径（dirWin）。
+// dirWin 形如 'AppData/Roaming/<app>/...'（Roaming 类）或 'AppData/Local/<app>/...'
+// （Local 类）：优先用进程环境里的 APPDATA / LOCALAPPDATA（组策略/重定向可能把它们
+// 指到 USERPROFILE 之外），缺失才回退 ~/AppData/Roaming|/Local。返回绝对路径；
+// 调用方 resolve(baseDir, abs) 在 Windows/POSIX 都原样取该绝对路径。
 function globalRelDir(target) {
   const g = target.global;
   if (!g) return null;
-  if (process.platform === 'win32' && g.dirWin) return g.dirWin;
+  if (process.platform === 'win32' && g.dirWin) {
+    const roaming = /^AppData[\\/]Roaming[\\/](.+)$/i.exec(g.dirWin);
+    if (roaming) {
+      const base = process.env.APPDATA || resolve(homedir(), 'AppData', 'Roaming');
+      return resolve(base, roaming[1]);
+    }
+    const local = /^AppData[\\/]Local[\\/](.+)$/i.exec(g.dirWin);
+    if (local) {
+      const base = process.env.LOCALAPPDATA || resolve(homedir(), 'AppData', 'Local');
+      return resolve(base, local[1]);
+    }
+    return g.dirWin;
+  }
   return g.dir;
 }
 
@@ -275,10 +313,10 @@ function appendSentinelSection(filePath, content, label) {
         + `本次保留不动（同名路由仅允许一个生效；任务 7 将支持备份后接管迁移）。`);
       return;
     }
-    writeFileSync(filePath, existing.replace(/\s+$/, '') + '\n\n' + wrapWithSentinel(content), 'utf8');
+    atomicWriteFileSync(filePath, existing.replace(/\s+$/, '') + '\n\n' + wrapWithSentinel(content));
     console.log(`  ✅ ${label}: 追加 skills 引用 -> ${filePath}`);
   } else {
-    writeFileSync(filePath, wrapWithSentinel(content), 'utf8');
+    atomicWriteFileSync(filePath, wrapWithSentinel(content));
     console.log(`  ✅ ${label}: bootstrap -> ${filePath}`);
   }
 }
@@ -287,7 +325,7 @@ function appendSentinelSection(filePath, content, label) {
 // 检测到旧 superpowers-zh 同名机制文件时只 WARN 不动。
 function writeStandaloneRule(filePath, content, label, legacyZhPath) {
   mkdirSync(dirname(filePath), { recursive: true });
-  writeFileSync(filePath, content, 'utf8');
+  atomicWriteFileSync(filePath, content);
   console.log(`  ✅ ${label}: bootstrap rule -> ${filePath}`);
   if (legacyZhPath && existsSync(legacyZhPath)) {
     console.warn(`  ⚠️ WARN ${label}: 检测到旧 superpowers-zh 规则文件 ${legacyZhPath}，已保留不动；`
@@ -787,16 +825,39 @@ function filesEqual(a, b) {
   }
 }
 
+// lstat 判定路径本身（不跟随）是否为符号链接；Windows junction 在 Node 下也报 true。
+function isSymlinkPath(p) {
+  try {
+    return lstatSync(p).isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
 // 只安装我们自己拥有、且目标处缺失或与源字节一致的文件；目标处存在但内容
 // 不同的文件视为用户/他方内容，WARN 且不动。
 function installOwnedFiles(srcDir, destDir, fileNames, label) {
   mkdirSync(destDir, { recursive: true });
+  // 容器本身是链接（含 Windows junction）：写入会落到链接目标（可能在项目/家目录
+  // 之外）——整目录跳过防穿越。
+  if (isSymlinkPath(destDir)) {
+    console.warn(`  ⚠️ WARN ${label}: 目标目录 ${destDir} 是符号链接/junction，为防目标侧穿越，`
+      + '本次不向其写入任何文件（链接目标未触及）。');
+    return 0;
+  }
   let installed = 0;
   for (const name of fileNames) {
     const src = resolve(srcDir, name);
     const dst = resolve(destDir, name);
     if (!existsSync(src)) continue;
-    if (existsSync(dst)) {
+    let dstStat;
+    try { dstStat = lstatSync(dst); } catch { dstStat = null; }
+    if (dstStat) {
+      // 同名文件是链接：copyFileSync 会穿透写链接目标，必须跳过。
+      if (dstStat.isSymbolicLink()) {
+        console.warn(`  ⚠️ WARN ${label}: ${dst} 是符号链接/junction，为防穿越保留不动（链接目标未触及）。`);
+        continue;
+      }
       if (filesEqual(src, dst)) continue;
       console.warn(`  ⚠️ WARN ${label}: ${dst} 已存在且内容与本包不同，保留不动（任务 7 将做读改写合并）。`);
       continue;
@@ -843,11 +904,16 @@ function ensureProjectConfig(baseDir, strict) {
   const cfgPath = resolve(baseDir, '.jevzh.json');
   if (existsSync(cfgPath)) {
     let existingStrict;
+    let parsed = true;
     try {
       existingStrict = JSON.parse(readFileSync(cfgPath, 'utf8')).strict;
-    } catch {}
+    } catch {
+      parsed = false;
+      console.warn(`  ⚠️ WARN ${cfgPath} 不是合法 JSON（解析失败）：本次按默认配置在内存中取值运行，`
+        + '且不会覆盖这个坏文件；请手工修复其 JSON 语法或删除后重跑安装。');
+    }
     console.log(`  ℹ️  已存在 .jevzh.json：保留用户配置不覆盖（strict 等字段均取自既有文件`
-      + `${existingStrict !== undefined ? `，当前 strict=${existingStrict}` : ''}；`
+      + `${parsed && existingStrict !== undefined ? `，当前 strict=${existingStrict}` : ''}；`
       + `本次${strict ? '的 --strict ' : ''}不改写它，可用 JEVZH_STRICT=1 临时开启严格模式）。`);
     return;
   }
@@ -877,7 +943,7 @@ function writeSkillMeta(destSkillDir, target, isGlobal) {
     scope: isGlobal ? 'global' : 'project',
     target: target.name,
   };
-  writeFileSync(resolve(destSkillDir, '.jevzh-meta.json'), JSON.stringify(meta, null, 2) + '\n', 'utf8');
+  atomicWriteFileSync(resolve(destSkillDir, '.jevzh-meta.json'), JSON.stringify(meta, null, 2) + '\n');
 }
 
 function installSkillsForTarget(target, baseDir, isGlobal, opts) {
@@ -886,13 +952,31 @@ function installSkillsForTarget(target, baseDir, isGlobal, opts) {
   const names = selectedSkillNames(opts.noJev);
   mkdirSync(dest, { recursive: true });
 
+  // I-1：技能容器本身是符号链接/junction（Windows npx 缓存、用户手工 junction 都可能
+  // 命中），继续写入会落到链接目标、穿越到项目/家目录之外。整个 target 判失败，不写任何文件。
+  if (isSymlinkPath(dest)) {
+    const msg = `技能目标目录 ${dest} 是符号链接/junction，为防目标侧穿越，已跳过整个 ${target.name} target`
+      + '（未向链接目标写入任何文件）。';
+    console.warn(`  ⚠️ WARN ${msg}`);
+    throw new Error(msg);
+  }
+
   let added = 0;
   let already = 0;
   let warned = 0;
   for (const name of names) {
     const src = resolve(SKILLS_SRC, name);
     const dst = resolve(dest, name);
-    if (existsSync(dst)) {
+    // 先 lstat（不跟随）：技能子目录是链接时绝不能穿透复制/写 meta，也不能穿透读 meta。
+    let dstStat;
+    try { dstStat = lstatSync(dst); } catch { dstStat = null; }
+    if (dstStat) {
+      if (dstStat.isSymbolicLink()) {
+        console.warn(`  ⚠️ WARN 技能目标 ${dst} 是符号链接/junction，为防目标侧穿越跳过该技能`
+          + '（不写入、不读取链接目标）。');
+        warned++;
+        continue;
+      }
       if (isOurManaged(dst)) {
         already++;
       } else {
@@ -1176,11 +1260,13 @@ function writeOrDelete(filePath, head, tail) {
   if (body.length === 0) {
     rmSync(filePath);
   } else {
-    writeFileSync(filePath, body + '\n', 'utf8');
+    atomicWriteFileSync(filePath, body + '\n');
   }
 }
 
 // 切除一段 begin/end 哨兵（精确配对）；返回切除后的文本与是否切除。
+// S-2：配对区间内若再出现 begin（畸形嵌套/双 begin 单 end），无法判定用户内容边界，
+// 返回 malformed=true，由调用方 WARN 并整文件保留，绝不吞掉区间里的用户内容。
 function cutSentinelPair(content, begin, end) {
   let text = content;
   let cut = false;
@@ -1189,18 +1275,28 @@ function cutSentinelPair(content, begin, end) {
     if (i === -1) break;
     const j = text.indexOf(end, i + begin.length);
     if (j === -1) break;
+    if (text.indexOf(begin, i + begin.length) !== -1
+      && text.indexOf(begin, i + begin.length) < j) {
+      return { text: content, cut: false, malformed: true };
+    }
     text = text.slice(0, i) + text.slice(j + end.length);
     cut = true;
   }
-  return { text, cut: cut || text !== content };
+  return { text, cut: cut || text !== content, malformed: false };
 }
 
 // v1.1.x 旧 zh 安装无哨兵，凭固定标题 + 段尾兜底识别切除（沿用基座逻辑）。
+// S-1：除标题行本身外，切除区间还必须含至少一个高置信 zh 特征（品牌串 superpowers-zh
+// 或 FALLBACK_TAIL_HINTS 尾句之一）；用户自写同名 H1 但无 zh 特征时不切，交 WARN 手工处理。
 function cutLegacyZhMarkedSection(content) {
   let idx = -1;
+  let matchedMarker = null;
   for (const marker of ZH_SECTION_MARKERS) {
     const i = content.indexOf(marker);
-    if (i !== -1 && (idx === -1 || i < idx)) idx = i;
+    if (i !== -1 && (idx === -1 || i < idx)) {
+      idx = i;
+      matchedMarker = marker;
+    }
   }
   if (idx === -1) return { text: content, cut: false, unresolvable: false };
 
@@ -1220,6 +1316,13 @@ function cutLegacyZhMarkedSection(content) {
   }
 
   if (end === -1) return { text: content, cut: false, unresolvable: true };
+
+  // 只检查标题行之后的区间，标题自身的 "Superpowers-ZH" 不算高置信特征。
+  const region = content.slice(idx + matchedMarker.length, end);
+  const hasHighConfidenceZh = region.toLowerCase().includes('superpowers-zh')
+    || FALLBACK_TAIL_HINTS.some(hint => region.includes(hint));
+  if (!hasHighConfidenceZh) return { text: content, cut: false, unresolvable: true };
+
   return { text: content.slice(0, idx) + content.slice(end), cut: true, unresolvable: false };
 }
 
@@ -1230,17 +1333,27 @@ function cleanBootstrapFile(filePath) {
   let changed = false;
 
   const ours = cutSentinelPair(text, SENTINEL_BEGIN, SENTINEL_END);
+  if (ours.malformed) {
+    console.warn(`  ⚠️ WARN ${filePath}: jevzh 哨兵标记畸形（begin 重复/嵌套且无法可靠配对），`
+      + '为避免误删用户内容已整文件跳过，请手工检查哨兵后重试。');
+    return false;
+  }
   text = ours.text;
   changed = changed || ours.cut;
 
   const legacy = cutSentinelPair(text, ZH_SENTINEL_BEGIN, ZH_SENTINEL_END);
+  if (legacy.malformed) {
+    console.warn(`  ⚠️ WARN ${filePath}: 旧 superpowers-zh 哨兵标记畸形（begin 重复/嵌套且无法可靠配对），`
+      + '为避免误删用户内容已整文件跳过，请手工检查哨兵后重试。');
+    return false;
+  }
   text = legacy.text;
   changed = changed || legacy.cut;
 
   const marked = cutLegacyZhMarkedSection(text);
   if (marked.unresolvable) {
-    console.warn(`  ⚠️ WARN ${filePath}: 无法可靠识别旧 superpowers-zh 段尾，已跳过以避免数据丢失，`
-      + '请手动删除以 "Superpowers-ZH" 开头的整段。');
+    console.warn(`  ⚠️ WARN ${filePath}: 无法可靠识别旧 superpowers-zh 区段（同名标题但缺少品牌串/尾句等高置信特征，`
+      + '或段尾不可判定），已跳过以避免数据丢失，请手动检查以 "Superpowers-ZH" 开头的整段。');
     return false;
   }
   text = marked.text;
@@ -1255,12 +1368,28 @@ function uninstallSkillsForTarget(target, baseDir, isGlobal) {
   const relDir = isGlobal ? globalRelDir(target) : target.dir;
   if (!relDir) return 0;
   const dest = resolve(baseDir, relDir);
-  if (!existsSync(dest)) return 0;
+  // 用 lstat（不跟随）：悬空链接 existsSync 报 false，但链接本身仍在。
+  let destStat;
+  try { destStat = lstatSync(dest); } catch { return 0; }
+  // 容器本身是链接（如 .claude/skills 是 junction 指向别处）：只摘链接本身，
+  // 绝不 recursive —— 否则会删掉链接目标（可能在家目录/项目之外）里的全部文件。
+  if (destStat.isSymbolicLink()) {
+    console.warn(`  ⚠️ WARN ${target.name} 技能容器 ${dest} 本身是符号链接/junction：`
+      + '仅摘除该链接（未使用递归），链接目标内的文件一律未触及，请自行确认目标内容。');
+    rmSync(dest, { force: true });
+    return 0;
+  }
   const names = listSourceSkillNames();
   let removed = 0;
   for (const name of names) {
     const skillDir = resolve(dest, name);
-    if (!existsSync(skillDir)) continue;
+    let skillStat;
+    try { skillStat = lstatSync(skillDir); } catch { continue; }
+    // 技能子目录是链接：WARN 并保留，绝不递归删外部；也不穿透读 meta 误判归属。
+    if (skillStat.isSymbolicLink()) {
+      console.warn(`  ⚠️ WARN ${skillDir} 是符号链接/junction，卸载保留该链接（不递归、不触及链接目标）。`);
+      continue;
+    }
     // 只删本包安装（带本包 meta）的同名技能副本；用户/他方同名目录绝不删。
     if (!isOurManaged(skillDir)) {
       console.warn(`  ⚠️ WARN ${skillDir} 非本包管理（无本包 .jevzh-meta.json），卸载保留不动。`);
@@ -1280,10 +1409,24 @@ function uninstallSkillsForTarget(target, baseDir, isGlobal) {
 
 // 卸载 hooks/scripts：只删与本包源字节一致的已安装文件，不同则 WARN 保留。
 function uninstallOwnedDir(srcDir, destDir, fileNames, label) {
-  if (!existsSync(destDir)) return;
+  let destStat;
+  try { destStat = lstatSync(destDir); } catch { return; }
+  // 容器（hooks/scripts）本身是链接：只摘链接本身，绝不递归触及目标。
+  if (destStat.isSymbolicLink()) {
+    console.warn(`  ⚠️ WARN ${label}: 目录 ${destDir} 本身是符号链接/junction：`
+      + '仅摘除该链接（未使用递归），链接目标内的文件一律未触及。');
+    rmSync(destDir, { force: true });
+    return;
+  }
   for (const name of fileNames) {
     const dst = resolve(destDir, name);
-    if (!existsSync(dst)) continue;
+    let dstStat;
+    try { dstStat = lstatSync(dst); } catch { continue; }
+    // 同名条目是链接：保留链接本身（rm 虽只摘链，也不替用户决定），不穿透比较。
+    if (dstStat.isSymbolicLink()) {
+      console.warn(`  ⚠️ WARN ${label}: ${dst} 是符号链接/junction，卸载保留该链接（不触及链接目标）。`);
+      continue;
+    }
     const src = resolve(srcDir, name);
     if (existsSync(src) && filesEqual(src, dst)) {
       rmSync(dst, { force: true });
@@ -1304,10 +1447,44 @@ function uninstallHooksForTarget(target, baseDir) {
   uninstallOwnedDir(SCRIPTS_SRC, resolve(baseDir, dirname(target.hooks), 'scripts'), GATE_SCRIPT_FILES, `${target.name} scripts`);
 }
 
-function uninstall(isGlobal) {
+function uninstall(isGlobal, force = false) {
   const baseDir = isGlobal ? homedir() : PROJECT_DIR;
   console.log(`\n  jevzh v${PKG.version} — jev-superpowers-zh 卸载（${isGlobal ? '全局' : '项目级'}）\n`);
   console.log(`  目标: ${baseDir}\n`);
+
+  // I-2：卸载与安装共用同一套家目录/系统目录护栏（此前只在安装侧拦）。
+  // 系统目录一律拒绝（--force 也不绕过）；家目录默认拒绝，--force 可显式绕过；
+  // 全局卸载（homedir 基址）是正常路径，不受此限。
+  if (!isGlobal && isSystemDir(PROJECT_DIR)) {
+    console.error(
+`  ⚠️  当前目录是系统目录: ${PROJECT_DIR}
+
+    jevzh 不会在系统目录执行项目级卸载 —— 递归清理在这里可能误删系统文件，
+    且管理员 PowerShell/cmd 的默认 cwd（C:\\Windows\\System32）本来就不是项目目录。
+
+    请先切到你的项目目录再卸载：
+      cd D:\\path\\to\\your\\project
+      npx jevzh --uninstall
+
+    若要清理用户级安装，用全局卸载（正常路径，不受此限）：
+      npx jevzh --global --uninstall
+`);
+    return 1;
+  }
+  if (!isGlobal && !force && isHomeDir(PROJECT_DIR)) {
+    console.error(
+`  ⚠️  当前目录是用户主目录: ${PROJECT_DIR}
+
+  jevzh 项目级卸载会按相对路径清理 .claude/.trae 等目录，在 ~/ 下执行可能
+  误删你全局工具的共享配置与技能。
+
+  - 清理全局安装请用（正常路径）：
+      npx jevzh --global --uninstall   （等价 -g -u）
+  - 若确实要在主目录按项目级方式清理，显式加 --force：
+      npx jevzh --uninstall --force
+`);
+    return 1;
+  }
 
   if (!existsSync(SKILLS_SRC)) {
     console.error('  ❌ 错误：skills 源目录不存在，无法识别要卸载的 skill 名单。');
@@ -1348,21 +1525,27 @@ function uninstall(isGlobal) {
   const legacyDelete = isGlobal ? LEGACY_ZH_BOOTSTRAP_DELETE_GLOBAL : LEGACY_ZH_BOOTSTRAP_DELETE_PROJECT;
   const cleanList = isGlobal ? BOOTSTRAP_CLEAN_SECTION_GLOBAL : BOOTSTRAP_CLEAN_SECTION_PROJECT;
 
+  // S-6：整删名单逐项 lstat —— 只删普通文件/链接本身；条目意外是目录（如用户把
+  // .trae/rules/jevzh.md 建成了目录）时 WARN 跳过并继续后续清单，避免 EISDIR 中断，
+  // 也绝不递归删目录。
+  const removeIfFile = (full, okLog) => {
+    let st;
+    try { st = lstatSync(full); } catch { return; }
+    if (st.isDirectory()) {
+      console.warn(`  ⚠️ WARN ${full} 是目录而非本包文件：已跳过（不递归删除），请手工检查该目录。`);
+      return;
+    }
+    rmSync(full, { force: true });
+    console.log(okLog);
+    bootstrapsRemoved++;
+  };
   for (const rel of ourDelete) {
     const full = resolve(baseDir, rel);
-    if (existsSync(full)) {
-      rmSync(full, { force: true });
-      console.log(`  ✅ 删除 bootstrap: ${full}`);
-      bootstrapsRemoved++;
-    }
+    removeIfFile(full, `  ✅ 删除 bootstrap: ${full}`);
   }
   for (const rel of legacyDelete) {
     const full = resolve(baseDir, rel);
-    if (existsSync(full)) {
-      rmSync(full, { force: true });
-      console.log(`  ✅ 清理旧 superpowers-zh 痕迹: ${full}`);
-      bootstrapsRemoved++;
-    }
+    removeIfFile(full, `  ✅ 清理旧 superpowers-zh 痕迹: ${full}`);
   }
   for (const rel of cleanList) {
     const full = resolve(baseDir, rel);
@@ -1440,6 +1623,22 @@ function httpProbe(urlString, timeoutMs = 2000) {
   });
 }
 
+// JEVZH_STRICT 真值词，与 scripts/jev-readiness 的 bool_word 同口径。
+const STRICT_TRUTH_WORDS = new Set(['1', 'true', 'yes', 'on']);
+function strictBoolWord(v) {
+  return STRICT_TRUTH_WORDS.has(String(v ?? '').trim().toLowerCase());
+}
+
+// 严格模式有效值口径（与 scripts/jev-readiness 一致）：
+//   env JEVZH_STRICT（只要变量被设置即生效，真值词 1/true/yes/on，其余词按 false）
+//   > .jevzh.json 的 strict 布尔 > false。
+function resolveStrict(cfgStrict) {
+  if (Object.prototype.hasOwnProperty.call(process.env, 'JEVZH_STRICT')) {
+    return { value: strictBoolWord(process.env.JEVZH_STRICT), fromEnv: true };
+  }
+  return { value: cfgStrict === true, fromEnv: false };
+}
+
 async function readinessReport(baseDir, isGlobal, strict) {
   const missing = [];
   for (const t of READY_TOOLS) {
@@ -1449,18 +1648,26 @@ async function readinessReport(baseDir, isGlobal, strict) {
 
   let backendCfg = 'auto';
   let baseUrl = 'http://127.0.0.1:8000';
+  let cfgStrict = false;
   if (!isGlobal) {
     try {
       const c = JSON.parse(readFileSync(resolve(baseDir, '.jevzh.json'), 'utf8'));
       if (c && typeof c === 'object') {
         if (typeof c.backend === 'string') backendCfg = c.backend;
         if (typeof c.baseUrl === 'string') baseUrl = c.baseUrl;
+        cfgStrict = c.strict === true;
       }
     } catch {}
   }
   if (process.env.JEVZH_BACKEND) backendCfg = process.env.JEVZH_BACKEND;
   if (process.env.TYPESAFE_BASE_URL) baseUrl = process.env.TYPESAFE_BASE_URL;
   if (!['auto', 'cloud', 'local', 'off'].includes(backendCfg)) backendCfg = 'auto';
+  // 项目级：配置文件在就绪报告前已生成（--strict 新写入即 strict:true，既有配置不覆盖）；
+  // 文件意外缺失时退回 CLI 标志。全局：无项目配置，直接取 CLI 标志。
+  const cliFallback = isGlobal
+    ? strict === true
+    : strict === true && !existsSync(resolve(baseDir, '.jevzh.json'));
+  const strictState = resolveStrict(cfgStrict || cliFallback);
 
   let backend = 'none';
   if (backendCfg !== 'off') {
@@ -1492,7 +1699,12 @@ async function readinessReport(baseDir, isGlobal, strict) {
     }
   }
   console.log(`  后端：${backend}（backend=${backendCfg}，baseUrl=${baseUrl}）`);
-  console.log(`  严格模式：${strict ? '开启（strict=true，环境型失败 exit 2）' : '关闭（软降级；JEVZH_STRICT=1 可开启）'}`);
+  if (strictState.value) {
+    console.log('  严格模式：开启（strict=true，环境型失败 exit 2'
+      + `${strictState.fromEnv ? '；来自 JEVZH_STRICT 环境变量' : ''}）`);
+  } else {
+    console.log(`  严格模式：关闭（软降级；JEVZH_STRICT=1 可开启${strictState.fromEnv ? '；当前值来自 JEVZH_STRICT 环境变量' : ''}）`);
+  }
   console.log('  ────────────────────────────────────────────────────');
 }
 
@@ -1555,7 +1767,7 @@ async function install(forceToolName, opts) {
   }
 
   console.log(`  源: ${skillCount(noJev)} 个 skills${noJev ? '（--no-jev 纯中文形态，不含 6 个 jev-* 技能）' : '（21 中文 + 6 jev-*）'}`);
-  console.log(`  模式: ${isGlobal ? '全局（所有项目共享，装到用户级目录）' : '项目级'}${noJev ? '；不接线 hooks、不生成 .jevzh.json' : ''}${strict ? '；新配置 strict=true' : ''}`);
+  console.log(`  模式: ${isGlobal ? '全局（所有项目共享，装到用户级目录）' : '项目级'}${noJev ? '；不接线 hooks、不生成 .jevzh.json' : ''}${!noJev && strict ? '；新配置 strict=true' : ''}`);
   console.log(`  目标: ${baseDir}\n`);
 
   const subOpts = { noJev, strict };
@@ -1716,13 +1928,13 @@ async function main() {
       return 64;
     }
     if (opts.uninstall) {
-      return uninstall(opts.isGlobal);
+      return uninstall(opts.isGlobal, opts.force);
     }
     return install(toolName, opts);
   }
 
   if (opts.uninstall) {
-    return uninstall(opts.isGlobal);
+    return uninstall(opts.isGlobal, opts.force);
   }
 
   return install(undefined, opts);
@@ -1751,4 +1963,7 @@ export {
   SENTINEL_END,
   ZH_SENTINEL_BEGIN,
   ZH_SENTINEL_END,
+  isSystemDir,
+  atomicWriteFileSync,
+  strictBoolWord,
 };
