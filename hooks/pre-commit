@@ -5,9 +5,10 @@
 #   1. 最多读 1MB+1 字节（S-4）：读到第 1048577 字节即超限 → fail-closed 进门；
 #   2. 空 stdin：回落门禁（与上游一致）；
 #   3. 廉价预筛：载荷含 commit/push 字样才继续，否则 exit 0（非提交快路径）；
-#   4. node JSON.parse 取 tool_input.command（缺省回落顶层 command），对解码后
-#      字符串做 git 提交/推送语义正则；node 缺失/JSON 损坏/字段类型异常且预筛
-#      命中时一律 fail-closed 进门（exit 2 不可判定也进门）。
+#   4. node JSON.parse 取 tool_input.command（缺省回落顶层 command），先折叠
+#      shell 反斜杠续行（"\<LF>"，I-2），再对解码后字符串做 git 提交/推送
+#      语义正则；node 缺失/JSON 损坏/字段类型异常且预筛命中时一律 fail-closed
+#      进门（exit 2 不可判定也进门）。
 # 命中提交命令后经统一入口 scripts/jev-gate commit 执行 git jev check：
 #   - 环境型失败（工具缺失/后端不可达/git 缺失）：soft 中文 WARN 后 exit 0，
 #     strict exit 2；
@@ -84,6 +85,9 @@ else
               c = j.command;
             }
             if (typeof c !== "string") process.exit(2);
+            // I-2：先折叠 shell 反斜杠续行（"\<LF>/\<CRLF>"），否则
+            // `git \<newline> commit` 这一合法单命令会被 [^\n] 挡在门外。
+            c = c.replace(/\\\r?\n[ \t]*/g, " ");
             // 同行内出现 git（或 git.exe，允许绝对路径前缀）后接 commit/push；
             // gitx/commit-done 等不会误伤（git 后须为空白/结尾，commit 须词边界）。
             const re = /git(\.exe)?(\s|$)[^\n]*\b(commit|push)\b/i;

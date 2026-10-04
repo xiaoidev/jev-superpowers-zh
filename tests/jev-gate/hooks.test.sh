@@ -425,6 +425,11 @@ assert_not_contains "$OUT" "[门禁降级]" "3.I-1 git status：无门控输出"
 run_poff "$P_ECHO"
 assert_eq "$RC" "0" "3.I-1 echo commit-done：无 git 语义不进门 → 0"
 assert_not_contains "$OUT" "[门禁降级]" "3.I-1 commit-done：预筛命中后由 node 正则否决"
+# I-2：shell 反斜杠续行是合法单命令写法（git \<LF>commit），折叠后必须进门
+P_CONT="$(node -e 'process.stdout.write(JSON.stringify({tool_input:{command:"git \\\ncommit -m x"}}))')"
+run_poff "$P_CONT"
+assert_eq "$RC" "0" "3.I-2 反斜杠续行 git \\<NL>commit：折叠后进门 → 0"
+assert_contains "$OUT" "[门禁降级]" "3.I-2 续行：门确实执行（[门禁降级]）"
 
 # node 缺失（立即 127 的 stub）：预筛命中后解析不可用 → fail-closed 进门。
 # 全链路 node 不可用下 jev-gate 契约为「就绪状态读取失败…保守阻断」exit 2。
@@ -554,6 +559,15 @@ echo dirty > "$R2/sneaky.txt"
 OUT="$(cd "$R2" && JEVZH_STRICT=1 bash "$HOOKS/stop" 2>&1)"; RC=$?
 assert_eq "$RC" "2" "4.未提交变更 strict：exit 2"
 assert_contains "$OUT" "未提交" "4.未提交变更 strict：中文阻断说明"
+
+# 4.2b R-1：stop 的 strict 纯本地判定（env>json），无缓存、无 env 也必须立即
+# strict——不允许读旧缓存出现 soft→strict 的 TTL 滞后窗口。
+R2B="$TMP/r2b"; make_repo "$R2B" true
+echo dirty > "$R2B/sneaky.txt"
+rm -f "$STATE_DIR"/jevzh-*.state
+OUT="$(cd "$R2B" && env -u JEVZH_STRICT -u TYPESAFE_BASE_URL bash "$HOOKS/stop" 2>&1)"; RC=$?
+assert_eq "$RC" "2" "4.R-1 strict:true json + 无缓存 + 无 env：stop 立即 strict → 2"
+assert_contains "$OUT" "未提交" "4.R-1 阻断说明含未提交变更"
 
 # 4.3 test.sh 失败（工作树干净）：soft 0
 R3="$TMP/r3"; make_repo "$R3" false

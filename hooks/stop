@@ -8,8 +8,11 @@
 # 前两段仅在 git 仓库内执行，属环境/执行状态：strict 中文 stderr + exit 2，
 # soft 降级为 WARN + 继续。limpet 门始终执行：判定型否决（limpet 可用但结论
 # 否决）即使 soft 也 exit 2；limpet 环境缺失时由 jev-gate 按 strict/soft 分流。
-# strict/soft 读就绪缓存（--cached，stop 频繁触发）；解析失败按 soft——
-# fail-open 仅适用于前两段本地状态检查，limpet 门由 jev-gate 自行判定。
+# strict/soft 纯本地判定（与 pre-commit 同口径）：JEVZH_STRICT(env) >
+# .jevzh.json strict > 默认 soft；不读 --cached 缓存——避免 soft→strict 切换
+# 后存在缓存 TTL 滞后窗口（stop 在会话结束才触发，错放一次即不可追）；
+# 也不做任何工具/后端探测。node 缺失/配置损坏按 soft（仅影响前两段本地检查，
+# limpet 门由 jev-gate 自行实探，判定型否决始终 exit 2）。
 #
 # S-3：strict 不再命中第一个就退出——依次跑完三段，收集全部命中项后统一
 # stderr 输出一次并 exit 2（soft 的逐条 WARN 聚合现状不变）。
@@ -43,37 +46,26 @@ run_to() {
         "$@"
     fi
 }
-# 本地缓存读取专用：固定上限，不吃 JEVZH_HOOK_TIMEOUT（该变量是给「可能挂起
-# 的外部探测/门」用的；冷盘上 --cached 本身可能要 1~2s，被测试加速值误杀会让
-# strict 口径静默退化成 soft）。
-run_to_fixed() {
-    local secs="$1"; shift
-    if [ -n "$JEVZH_TIMEOUT_BIN" ]; then
-        "$JEVZH_TIMEOUT_BIN" "$secs" "$@"
-    else
-        "$@"
-    fi
-}
 is_timeout_rc() { [ "$1" = "124" ] || [ "$1" = "137" ]; }
 
 # limpet 门实际生效的超时秒数（仅用于对外文案；run_to 内部自行解析覆盖）。
 LIMPET_TIMEOUT_SECS="${JEVZH_HOOK_TIMEOUT:-30}"
 
-state_json=""
-state_rc=0
-# 注意：不可用 `if ! x=$(...); then rc=$?` —— `!` 会把 $? 重置为取反后的 0。
-state_json="$(run_to_fixed 30 bash "$PLUGIN_ROOT/scripts/jev-readiness" --project "$PROJECT_DIR" --json --cached 2>/dev/null)" || state_rc=$?
-if is_timeout_rc "$state_rc"; then
-    echo "WARN stop：jev-readiness 缓存读取超时（30s），strict 状态按 soft 处理。" >&2
-fi
-STRICT="$(printf '%s' "$state_json" | node -e '
-  let s="";
-  process.stdin.on("data", d => s += d);
-  process.stdin.on("end", () => {
-    try { process.stdout.write(JSON.parse(s).strict === true ? "1" : "0"); }
-    catch (e) { process.stdout.write("0"); }
-  });
-' 2>/dev/null || true)"
+STRICT="$(PROJECT_DIR="$PROJECT_DIR" node -e '
+  const fs = require("fs"), path = require("path");
+  const truthy = v => ["1","true","yes","on"].includes(String(v).toLowerCase());
+  let s = "0";
+  if (process.env.JEVZH_STRICT !== undefined) {
+    s = truthy(process.env.JEVZH_STRICT) ? "1" : "0";
+  } else {
+    try {
+      const j = JSON.parse(fs.readFileSync(path.join(process.env.PROJECT_DIR, ".jevzh.json"), "utf8"));
+      if (j !== null && typeof j === "object" && j.strict !== undefined && j.strict !== null
+          && truthy(j.strict)) s = "1";
+    } catch (e) { /* 配置缺失/损坏：默认 soft */ }
+  }
+  process.stdout.write(s);
+' 2>/dev/null || printf '0')"
 [ "$STRICT" = "1" ] || STRICT=0
 
 IN_REPO=0
