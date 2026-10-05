@@ -12,7 +12,9 @@
   },
   "scripts": {
     "test": "node --test",
-    "version": "node scripts/sync-plugin-version.js && git add .claude-plugin/plugin.json .claude-plugin/marketplace.json .cursor-plugin/plugin.json .codex-plugin/plugin.json gemini-extension.json"
+    "version-sync": "node scripts/sync-plugin-version.js",
+    "check:version": "node scripts/sync-plugin-version.js --check",
+    "version": "node scripts/sync-plugin-version.js && git add .claude-plugin/plugin.json .claude-plugin/marketplace.json .cursor-plugin/plugin.json .codex-plugin/plugin.json .kimi-plugin/plugin.json gemini-extension.json"
   },
   "files": [
     "bin/",
@@ -24,6 +26,7 @@
     ".claude-plugin/",
     ".cursor-plugin/",
     ".codex-plugin/",
+    ".kimi-plugin/",
     ".codex/INSTALL.md",
     ".opencode/",
     ".pi/extensions/",
@@ -32,7 +35,7 @@
     "GEMINI.md",
     "RELEASE-NOTES.zh.md",
     "gemini-extension.json",
-    "docs/",
+    "docs/*.md",
     "index.js",
     "README.md",
     "LICENSE"
