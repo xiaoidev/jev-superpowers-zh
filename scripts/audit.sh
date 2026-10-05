@@ -149,6 +149,7 @@ fi
 
 # 1d. 可执行位（git 索引 100755）
 declare -a EXEC_FILES=(
+  bin/jevzh.js
   hooks/pre-commit hooks/session-start hooks/stop
   scripts/jev-gate scripts/jev-readiness scripts/sync-plugin-version.js
   scripts/run-bash-tests.sh

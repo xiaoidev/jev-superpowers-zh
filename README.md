@@ -123,7 +123,7 @@ jevzh 安装器覆盖 26 个宿主目标。**仅 Claude Code 与 Cursor 自动�
 | `JEVZH_STRICT` | 覆盖严格模式；真值词为 `1|true|yes|on`（大小写不敏感），其余按假 |
 | `TYPESAFE_API_KEY` | 云端 TypeSafe 密钥；非空且不等于 `local` 才视为真实云密钥 |
 | `TYPESAFE_BASE_URL` | 覆盖后端基址（本地桥或自建端点） |
-| `JEVZH_HOOK_TIMEOUT` | 钩子内部门禁超时秒数（默认 30） |
+| `JEVZH_HOOK_TIMEOUT` | 钩子内部门禁超时秒数；默认值随平台/钩子不同：session-start 在 Windows（Git Bash/MSYS/Cygwin）为 30s、POSIX 为 10s；pre-commit 与 stop 全平台均为 30s |
 | `JEVZH_PROJECT` | 指定项目目录（默认取 git 顶层 → 当前目录） |
 
 就绪状态缓存在系统临时目录 `jevzh-<项目路径 sha256>.state`，包含 `state / missingTools[] / backend / strict / notified / ts` 字段。
@@ -163,7 +163,9 @@ npm run audit            # 双上游保真 + 契约/结构/安装矩阵全量审
 npm run audit:offline    # 同上但不读上游目录（--no-upstream，只跑仓内事实）
 ```
 
-`scripts/audit.sh` 直接执行时还支持：`--quick`（跳过 26 宿主安装矩阵等重项）、`-h/--help`、未知参数返回退出码 2。退出码约定：**0** 全过（允许 WARN）；**1** 存在 FAIL；**2** 参数错误。
+这三条 bash 命令跨平台可直接运行：POSIX 下调用 PATH 上的 bash；Windows 下经零依赖包装 [scripts/run-bash.js](scripts/run-bash.js) 自动定位 Git for Windows（依次探测 `C:\Program Files\Git\bin\bash.exe`、`C:\Program Files (x86)\Git\bin\bash.exe`，再回退 PATH，并用固定标记探活挡掉 WSL 的 bash 存根，避免 `node: command not found` 与 gitdir 错乱）；找不到可用 bash 时打印中文安装指引并以 127 退出。前提是安装 [Git for Windows](https://git-scm.com/download/win)。
+
+向脚本透传额外参数在 npm 命令后加 `--`：`npm run audit -- --quick`（跳过 26 宿主安装矩阵等重项）、`npm run audit -- --quick --no-upstream`、`npm run audit:offline -- --quick`。直接执行 `scripts/audit.sh` 还支持 `-h/--help`，未知参数返回退出码 2。退出码约定：**0** 全过（允许 WARN）；**1** 存在 FAIL；**2** 参数错误。
 
 双上游目录与环境变量：
 

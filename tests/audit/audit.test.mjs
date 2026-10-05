@@ -144,6 +144,7 @@ describe('git 模式位与仓库卫生', () => {
   });
 
   const execFiles = [
+    'bin/jevzh.js',
     'hooks/pre-commit',
     'hooks/session-start',
     'hooks/stop',

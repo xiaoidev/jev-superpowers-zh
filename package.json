@@ -12,9 +12,9 @@
   },
   "scripts": {
     "test": "node --test",
-    "test:bash": "bash scripts/run-bash-tests.sh",
-    "audit": "bash scripts/audit.sh",
-    "audit:offline": "bash scripts/audit.sh --no-upstream",
+    "test:bash": "node scripts/run-bash.js scripts/run-bash-tests.sh",
+    "audit": "node scripts/run-bash.js scripts/audit.sh",
+    "audit:offline": "node scripts/run-bash.js scripts/audit.sh --no-upstream",
     "version-sync": "node scripts/sync-plugin-version.js",
     "check:version": "node scripts/sync-plugin-version.js --check",
     "version": "node scripts/sync-plugin-version.js && git add .claude-plugin/plugin.json .claude-plugin/marketplace.json .cursor-plugin/plugin.json .codex-plugin/plugin.json .kimi-plugin/plugin.json gemini-extension.json"
