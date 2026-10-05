@@ -20,9 +20,16 @@ PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 # 其次 gtimeout（macOS coreutils），都没有则裸执行（保持现状）。
 # JEVZH_HOOK_TIMEOUT（秒）可覆盖默认阈值，仅供宿主自调/测试加速。
 # 用法：run_to <秒> <命令...>；超时返回 124（被 -9 收割时 137）。
-# session-start 的 jev-readiness 调用 10s 封顶：超时打 WARN 后继续，绝不
-# 卡住会话启动（soft 语义，就绪段回退空字符串）。
+# session-start 的 jev-readiness 调用封顶：超时打 WARN 后继续，绝不
+# 卡住会话启动（soft 语义，就绪段回退空字符串）。Windows（Git for
+# Windows/MSYS/Cygwin）下每次 node/git 进程派生成本显著（实测全探测
+# 可达 8s 以上），平台默认放宽到 30s；其他平台保持 10s。
 # ---------------------------------------------------------------------------
+SS_DEFAULT_TIMEOUT=10
+# OSTYPE 是 bash 启动即置的内置变量（msys*/mingw*/cygwin*），无需派生 uname。
+case "${OSTYPE:-}" in
+  msys*|mingw*|cygwin*) SS_DEFAULT_TIMEOUT=30 ;;
+esac
 JEVZH_TIMEOUT_BIN=""
 if command -v timeout >/dev/null 2>&1; then
   JEVZH_TIMEOUT_BIN="timeout"
@@ -40,7 +47,7 @@ run_to() {
 }
 
 # 就绪探测实际生效的超时秒数（仅用于对外文案；run_to 内部自行解析覆盖）。
-SS_TIMEOUT_SECS="${JEVZH_HOOK_TIMEOUT:-10}"
+SS_TIMEOUT_SECS="${JEVZH_HOOK_TIMEOUT:-$SS_DEFAULT_TIMEOUT}"
 
 # Read jev-using-superpowers content (the Jev router, not the non-Jev original)
 using_superpowers_content=$(cat "${PLUGIN_ROOT}/skills/jev-using-superpowers/SKILL.md" 2>&1 || echo "Error reading jev-using-superpowers skill")
@@ -66,9 +73,9 @@ PROJECT_DIR="${PWD:-.}"
 state_json=""
 need_mark=0
 rd_rc=0
-# S-1：readiness 10s 封顶，超时/失败均回退空段，不影响会话启动。
+# S-1：readiness 封顶超时，超时/失败均回退空段，不影响会话启动。
 # 注意：不可用 `if ! x=$(...); then rc=$?` —— `!` 会把 $? 重置为取反后的 0。
-state_json="$(run_to 10 bash "$PLUGIN_ROOT/scripts/jev-readiness" --project "$PROJECT_DIR" --json 2>/dev/null)" || rd_rc=$?
+state_json="$(run_to "$SS_TIMEOUT_SECS" bash "$PLUGIN_ROOT/scripts/jev-readiness" --project "$PROJECT_DIR" --json 2>/dev/null)" || rd_rc=$?
 if [ "$rd_rc" = "124" ] || [ "$rd_rc" = "137" ]; then
   echo "WARN session-start：jev-readiness 就绪探测超时（${SS_TIMEOUT_SECS}s），本次跳过门禁就绪段（不影响会话启动）。" >&2
 fi
@@ -173,9 +180,9 @@ if [ "$json_rc" -ne 0 ]; then
   exit 0
 fi
 
-# S-5：仅在最终 JSON 输出成功后置位（10s 封顶，失败忽略不影响退出）。
-if [ "$need_mark" = "1" ]; then
-  run_to 10 bash "$PLUGIN_ROOT/scripts/jev-readiness" --project "$PROJECT_DIR" \
+# S-5：仅在最终 JSON 输出成功后置位（封顶超时，失败忽略不影响退出）。
+if [ "$need_mark" = 1 ]; then
+  run_to "$SS_TIMEOUT_SECS" bash "$PLUGIN_ROOT/scripts/jev-readiness" --project "$PROJECT_DIR" \
     --cached --mark-notified >/dev/null 2>&1 || true
 fi
 

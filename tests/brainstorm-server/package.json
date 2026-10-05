@@ -1,0 +1,9 @@
+{
+  "name": "brainstorm-server-tests",
+  "version": "1.0.0",
+  "private": true,
+  "description": "brainstorming 本地 server.cjs 的离线测试（零第三方依赖：WebSocket 用 Node 内置实现）。文件名 *.check.js 以避免被 node --test 顶层发现，统一由 run-tests.sh / npm run test:bash 显式驱动。",
+  "scripts": {
+    "test": "bash run-tests.sh"
+  }
+}

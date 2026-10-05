@@ -153,6 +153,26 @@ npx jevzh --global --uninstall # 清理全局安装
 
 `.jevzh.json` 默认保留（含你的 backend/strict 选择）；旧 superpowers-zh 的哨兵段会被精确切除，你自己写的内容不动。
 
+## 质量保障与双上游审计
+
+```bash
+npm test                 # node:test 全量（安装器/共存/技能契约/文档链接等）
+npm run test:bash        # bash 离线套件统一入口（jev-gate 四件套、审计、
+                         # brainstorm-server、pi/opencode/kimi 宿主套件）
+npm run audit            # 双上游保真 + 契约/结构/安装矩阵全量审计
+npm run audit:offline    # 同上但不读上游目录（--no-upstream，只跑仓内事实）
+```
+
+`scripts/audit.sh` 直接执行时还支持：`--quick`（跳过 26 宿主安装矩阵等重项）、`-h/--help`、未知参数返回退出码 2。退出码约定：**0** 全过（允许 WARN）；**1** 存在 FAIL；**2** 参数错误。
+
+双上游目录与环境变量：
+
+- `JEVZH_UPSTREAM_ZH`（默认 `upstream/zh`）—— jnMetaCode/superpowers-zh 基线或活检出；`JEVZH_UPSTREAM_ZH_MODE=baseline`（默认，差异 FAIL）或 `worktree`（活上游，差异仅 WARN）；`JEVZH_UPSTREAM_JEV`（默认 `upstream/jev`）—— jev 英文上游，缺失时只 WARN（23 个契约 token 的离线检查不受影响）。
+- 21 个中文技能按品牌白名单（`npx superpowers-zh → npx jevzh`、`superpowers-zh → jev-superpowers-zh`）归一化后必须与 zh 上游逐字一致；fork 增量必须打「本节是 jev-superpowers-zh 的增量内容」标记。
+- `upstream/` 已被 `.gitignore` 忽略，检出/导出目录不入库。
+
+有意的 fork 分歧登记在 [scripts/audit-divergences.json](scripts/audit-divergences.json)（hooks 合并、installer 品牌化等 4 项，附 scope/upstream/reason/sourceText）。**只有在按规格主动改变这些衍件时**才同步更新该文件与 `.upstream-sync.json` 基线；任何未登记差异都会让审计 FAIL。
+
 ## 文档
 
 - [docs/jev-gate.md](docs/jev-gate.md) —— 8 个门禁子命令的阈值、退出码与故障排查

@@ -22,6 +22,9 @@ node_modules/
 .private-journal/
 *.log
 
+# 双上游审计的本地检出/导出目录（由 JEVZH_UPSTREAM_ZH/JEVZH_UPSTREAM_JEV 指向）
+upstream/
+
 # Python（serve-laya.py 本地桥运行产物）
 __pycache__/
 *.pyc

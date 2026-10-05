@@ -140,7 +140,7 @@ if [ "$NEED_BACKEND" = 1 ] && [ "$S_BACKEND" = "none" ]; then BACKEND_MISSING=1;
 if [ "$TOOL_MISSING" = 1 ] || [ "$BACKEND_MISSING" = 1 ]; then
   DETAILS=""
   if [ "$TOOL_MISSING" = 1 ]; then
-    DETAILS="  缺失工具：$NEED_TOOL（安装方式：$(install_hint "$NEED_TOOL")）"$'\n'
+    DETAILS="  缺失工具：${NEED_TOOL}（安装方式：$(install_hint "$NEED_TOOL")）"$'\n'
   fi
   if [ "$BACKEND_MISSING" = 1 ]; then
     DETAILS="${DETAILS}  后端不可用：本地可运行 scripts/serve-laya.py（heuristic 零依赖可用），云端需设置 TYPESAFE_API_KEY"$'\n'
@@ -304,7 +304,7 @@ case "$SUB" in
 
   limpet)
     if [ "$NRC" -eq 0 ]; then exit 0; fi
-    reject "limpet check 未证实全部验收标准（退出码 $NRC），收束被否决。"
+    reject "limpet check 未证实全部验收标准（退出码 ${NRC}），收束被否决。"
     ;;
 
   triage)
