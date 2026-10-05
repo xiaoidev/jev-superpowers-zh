@@ -134,10 +134,47 @@ test('Cursor：.cursor/hooks.json 小写 schema 合并，用户 command 保留',
     const cfg = JSON.parse(readText(path.join(dir, '.cursor', 'hooks.json')));
     const all = JSON.stringify(cfg.hooks);
     assert.match(all, /KEEP-CURSOR-HOOK/);
-    assert.match(all, /run-hook\.cmd session-start/);
-    assert.match(all, /run-hook\.cmd pre-commit/);
-    assert.match(all, /run-hook\.cmd stop/);
+    // R-3：cursor 项目根相对 + node 启动器
+    assert.match(all, /node \.cursor\/hooks\/run-hook\.cjs session-start/);
+    assert.match(all, /node \.cursor\/hooks\/run-hook\.cjs pre-commit/);
+    assert.match(all, /node \.cursor\/hooks\/run-hook\.cjs stop/);
     assert.ok(Array.isArray(cfg.hooks.sessionStart));
+  } finally {
+    rmFixture(dir);
+  }
+});
+
+test('R-3：Cursor 旧形态 ./hooks/run-hook.cmd 被就地归一为 node 启动器，不重复追加', () => {
+  const dir = mkFixture('jevzh-cursor-r3-normalize-');
+  const old = {
+    version: 1,
+    hooks: {
+      sessionStart: [{ command: './hooks/run-hook.cmd session-start' }],
+      preToolUse: [{ matcher: 'Bash', command: './hooks/run-hook.cmd pre-commit' }],
+      stop: [{ command: './hooks/run-hook.cmd stop' }],
+    },
+  };
+  fs.mkdirSync(path.join(dir, '.cursor'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.cursor', 'hooks.json'), JSON.stringify(old, null, 2));
+  try {
+    const r1 = run(['--tool', 'cursor'], { cwd: dir });
+    assert.equal(r1.status, 0, r1.stdout + r1.stderr);
+    const s1 = readText(path.join(dir, '.cursor', 'hooks.json'));
+    const cfg1 = JSON.parse(s1);
+    const flat = JSON.stringify(cfg1.hooks);
+    assert.match(flat, /node \.cursor\/hooks\/run-hook\.cjs session-start/);
+    assert.match(flat, /node \.cursor\/hooks\/run-hook\.cjs pre-commit/);
+    assert.match(flat, /node \.cursor\/hooks\/run-hook\.cjs stop/);
+    assert.doesNotMatch(flat, /run-hook\.cmd/, '旧 run-hook.cmd 形态应全部消失');
+    // 每事件恰好一条（归一而非追加）
+    assert.equal(cfg1.hooks.sessionStart.length, 1);
+    assert.equal(cfg1.hooks.preToolUse.length, 1);
+    assert.equal(cfg1.hooks.stop.length, 1);
+
+    // 幂等：第二次安装字节稳定
+    const r2 = run(['--tool', 'cursor'], { cwd: dir });
+    assert.equal(r2.status, 0, r2.stdout + r2.stderr);
+    assert.equal(readText(path.join(dir, '.cursor', 'hooks.json')), s1);
   } finally {
     rmFixture(dir);
   }

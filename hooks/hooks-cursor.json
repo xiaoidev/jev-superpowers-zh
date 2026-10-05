@@ -3,18 +3,18 @@
   "hooks": {
     "sessionStart": [
       {
-        "command": "./hooks/run-hook.cmd session-start"
+        "command": "node ./hooks/run-hook.cjs session-start"
       }
     ],
     "preToolUse": [
       {
         "matcher": "Bash",
-        "command": "./hooks/pre-commit"
+        "command": "node ./hooks/run-hook.cjs pre-commit"
       }
     ],
     "stop": [
       {
-        "command": "./hooks/stop"
+        "command": "node ./hooks/run-hook.cjs stop"
       }
     ]
   }

@@ -852,7 +852,7 @@ function generateCodeBuddyBootstrap(baseDir, isGlobal, opts) {
 // settings.json/.cursor/hooks.json 的读改写合并在任务 7 实现。
 // ---------------------------------------------------------------------------
 const HOOK_FILES = [
-  'hooks.json', 'hooks-cursor.json', 'session-start', 'pre-commit', 'stop', 'run-hook.cmd',
+  'hooks.json', 'hooks-cursor.json', 'session-start', 'pre-commit', 'stop', 'run-hook.cmd', 'run-hook.cjs',
 ];
 const GATE_SCRIPT_FILES = ['jev-readiness', 'jev-gate', 'serve-laya.py'];
 
@@ -1534,7 +1534,7 @@ function cutForeignMarkedSections(content) {
 function hookRuntimeFiles(target) {
   if (target.name === 'Claude Code') return HOOK_FILES.filter(f => f !== 'hooks-cursor.json');
   if (target.name === 'Cursor') {
-    return ['hooks-cursor.json', 'session-start', 'pre-commit', 'stop', 'run-hook.cmd'];
+    return ['hooks-cursor.json', 'session-start', 'pre-commit', 'stop', 'run-hook.cmd', 'run-hook.cjs'];
   }
   return [];
 }
@@ -1564,10 +1564,13 @@ function installHooksForTarget(target, baseDir, tx = null) {
     return;
   }
   if (hooks.installed > 0 || existsSync(hookDest)) {
+    // R-3：Cursor 项目钩子在项目根由宿主直生，统一经 node run-hook.cjs 跨平台启动；
+    // Claude 侧仍走 run-hook.cmd（宿主以 bash 执行）。
+    const launcher = target.name === 'Cursor' ? 'run-hook.cjs（node 启动）' : 'run-hook.cmd';
     console.log(`  ✅ ${target.name}: hooks 运行时 -> ${hookDest}`);
-    console.log(`     门禁脚本 -> ${scriptDest}（session-start/pre-commit/stop 经 run-hook.cmd 调用）`);
+    console.log(`     门禁脚本 -> ${scriptDest}（session-start/pre-commit/stop 经 ${launcher} 调用）`);
     if (process.platform === 'win32') {
-      console.log('     ℹ️  Windows 不跟踪可执行位：钩子统一由 run-hook.cmd 调 Git for Windows bash，无需 chmod +x。');
+      console.log('     ℹ️  Windows 不跟踪可执行位：钩子经启动器调 Git for Windows bash，无需 chmod +x。');
     }
   }
 }
@@ -1596,15 +1599,23 @@ function settingsHostsForTarget(target) {
 
 function toFwd(p) { return p.split(sep).join('/'); }
 
-function oursHookCommand(hooksAbsDir, schema, arg) {
-  if (schema === 'cursor') return `./hooks/run-hook.cmd ${arg}`;
+// R-3（Windows 实测）：Cursor 项目级钩子由宿主在【项目根】以 shell string
+// 派生（https://cursor.com/docs/hooks：project hooks run from the project root，
+// 路径须写 .cursor/hooks/... 而非 ./hooks/...）；且 Windows 下直生无扩展名
+// 脚本或 .cmd 均可能失败（cmd 不认、CreateProcess 不跑 .cmd）。故 cursor
+// 接线统一为 `node <hooksRel>/run-hook.cjs <arg>` 跨平台形态（.cjs 不受宿主
+// 项目 package.json type 影响）；Claude 仍走 ${CLAUDE_PLUGIN_ROOT} 绝对路径
+// + run-hook.cmd（宿主以 shell:bash 执行）。
+function oursHookCommand(hooksAbsDir, schema, arg, hooksRel = '.cursor/hooks') {
+  if (schema === 'cursor') return `node ${toFwd(hooksRel)}/run-hook.cjs ${arg}`;
   return `"${toFwd(resolve(hooksAbsDir, 'run-hook.cmd'))}" ${arg}`;
 }
 
 function normCmd(cmd) { return String(cmd || '').replace(/\\/g, '/'); }
 function cmdIsOurs(cmd, arg) {
+  // js 为开发期曾用形态（未发布），保留识别以便幂等归一/卸载切除。
   const n = normCmd(cmd);
-  return n.includes('run-hook.cmd') && n.includes(arg);
+  return /run-hook\.(cmd|cjs|js)(\s|$|["'])/.test(n) && n.includes(arg);
 }
 function cmdIsCompetitorJev(cmd) {
   const n = normCmd(cmd);
@@ -1665,10 +1676,10 @@ function wiredEvents(cfg, schema) {
   return wired;
 }
 
-function buildOurHookEntry(schema, event, hooksAbsDir) {
+function buildOurHookEntry(schema, event, hooksAbsDir, hooksRel = '.cursor/hooks') {
   const arg = HOOK_EVENTS.find(e => e.event === event).arg;
   const matcher = HOOK_EVENTS.find(e => e.event === event).matcher;
-  const command = oursHookCommand(hooksAbsDir, schema, arg);
+  const command = oursHookCommand(hooksAbsDir, schema, arg, hooksRel);
   if (schema === 'cursor') {
     return event === 'PreToolUse' ? { matcher, command } : { command };
   }
@@ -1676,7 +1687,10 @@ function buildOurHookEntry(schema, event, hooksAbsDir) {
 }
 
 // 读改写合并：保留未知键与既有条目，去重，改写 jev 上游引用，追加缺失事件。
-function mergeHooksConfig(cfg0, schema, hooksAbsDir) {
+// R-3：cursor 下任何本包 run-hook 旧形态（修复前的 ./hooks/run-hook.cmd、
+// 早期的 run-hook.js 等）就地归一为当前 `node <hooksRel>/run-hook.cjs <arg>`，
+// 避免重复追加与死路径。
+function mergeHooksConfig(cfg0, schema, hooksAbsDir, hooksRel = '.cursor/hooks') {
   const cfg = cfg0 && typeof cfg0 === 'object' ? cfg0 : {};
   if (!cfg.hooks || typeof cfg.hooks !== 'object') cfg.hooks = {};
   const rewrites = [];
@@ -1684,9 +1698,18 @@ function mergeHooksConfig(cfg0, schema, hooksAbsDir) {
     const jevEvent = cmdIsCompetitorJev(cmd);
     if (jevEvent) {
       const arg = HOOK_EVENTS.find(e => e.event === jevEvent).arg;
-      hookEntry.command = oursHookCommand(hooksAbsDir, schema, arg);
+      hookEntry.command = oursHookCommand(hooksAbsDir, schema, arg, hooksRel);
       rewrites.push(jevEvent);
       return true;
+    }
+    if (schema === 'cursor') {
+      const arg = HOOK_EVENTS.find(e => e.event === event).arg;
+      const canonical = oursHookCommand(hooksAbsDir, 'cursor', arg, hooksRel);
+      if (cmdIsOurs(cmd, arg) && normCmd(cmd).trim() !== normCmd(canonical).trim()) {
+        hookEntry.command = canonical;
+        rewrites.push(event);
+        return true;
+      }
     }
     return false;
   });
@@ -1696,7 +1719,7 @@ function mergeHooksConfig(cfg0, schema, hooksAbsDir) {
     const key = schema === 'cursor' ? CURSOR_EVENT_KEYS[e.event] : e.event;
     if (wired.has(e.event)) continue;
     if (!Array.isArray(cfg.hooks[key])) cfg.hooks[key] = [];
-    cfg.hooks[key].push(buildOurHookEntry(schema, e.event, hooksAbsDir));
+    cfg.hooks[key].push(buildOurHookEntry(schema, e.event, hooksAbsDir, hooksRel));
     appended.push(e.event);
   }
   return { cfg, rewrites, appended, wired: new Set([...wired, ...appended, ...rewrites]) };
@@ -1711,7 +1734,7 @@ function chooseSettingsCandidate(baseDir, host) {
     try {
       const cfg = JSON.parse(readFileSync(x.abs, 'utf8'));
       const raw = JSON.stringify(cfg || {});
-      if (raw.includes('run-hook.cmd') || /jev-superpowers(?!-zh)/.test(raw)) return x;
+      if (/run-hook\.(cmd|cjs|js)/.test(raw) || /jev-superpowers(?!-zh)/.test(raw)) return x;
     } catch { /* 坏文件在 preflight 已阻断 */ }
   }
   for (const x of existing) {
@@ -1829,10 +1852,12 @@ function preflightTarget(target, baseDir, isGlobal, opts) {
       let rewrites = [];
       if (existsSync(chosen.abs)) {
         const cfg = JSON.parse(readFileSync(chosen.abs, 'utf8'));
-        const wired = wiredEvents(cfg, host.schema);
-        const r = mergeHooksConfig(JSON.parse(readFileSync(chosen.abs, 'utf8')), host.schema, resolve(baseDir, host.hooksRel));
+        const r = mergeHooksConfig(cfg, host.schema, resolve(baseDir, host.hooksRel), host.hooksRel);
         rewrites = r.rewrites;
-        status = wired.size === HOOK_EVENTS.length ? 'wired' : (rewrites.length ? 'rewrite' : 'merge');
+        // R-3：本包旧形态（如 cursor 的 ./hooks/run-hook.cmd）会被归一化，
+        // 属于改写接管，需走备份；故 rewrites 优先于 wired 判定。
+        status = rewrites.length ? 'rewrite'
+          : (wiredEvents(cfg, host.schema).size === HOOK_EVENTS.length ? 'wired' : 'merge');
       }
       plan.hosts.push({ ...host, status, chosen: chosen.rel });
     }
@@ -2608,7 +2633,7 @@ function installSettingsForTarget(tx, plan) {
     const hooksAbsDir = resolve(baseDir, host.hooksRel);
     let cfg = {};
     if (existsSync(chosen.abs)) cfg = JSON.parse(readFileSync(chosen.abs, 'utf8'));
-    const merged = mergeHooksConfig(cfg, host.schema, hooksAbsDir);
+    const merged = mergeHooksConfig(cfg, host.schema, hooksAbsDir, host.hooksRel);
     const data = JSON.stringify(merged.cfg, null, 2) + '\n';
     const existed = tx.modifyOrCreateFile(chosen.abs, relFromBase(baseDir, chosen.abs), data);
     // 校验：三类事件均已接线且 JSON 可解析
@@ -3844,6 +3869,76 @@ function uninstallHooksForTarget(target, baseDir) {
   uninstallOwnedDir(SCRIPTS_SRC, resolve(baseDir, dirname(target.hooks), 'scripts'), GATE_SCRIPT_FILES, `${target.name} scripts`);
 }
 
+// 卸载侧接线切除（与安装的读改写合并互为逆操作）：从每个候选 settings/hooks
+// 文件中精确移除本包 run-hook 条目（含 R-3 修复前的旧形态），保留用户既有
+// 条目与未知键；事件清空则删键，hooks 清空则删键，整个文件被掏空到 {} 则
+// 删除文件（安装期纯为本包创建的 settings.json/.cursor/hooks.json）。
+// 残留死接线的实际危害：Cursor PreToolUse 在宿主侧会因 node/脚本不存在而
+// 每次 Bash 前失败，可能直接阻断用户命令——故卸载必须切除。
+function pruneOurHookSettings(target, baseDir) {
+  if (!target.hooks) return 0;
+  let totalRemoved = 0;
+  for (const host of settingsHostsForTarget(target)) {
+    for (const rel of host.candidates) {
+      const abs = resolve(baseDir, rel);
+      if (!existsSync(abs)) continue;
+      let cfg;
+      try {
+        cfg = JSON.parse(readFileSync(abs, 'utf8'));
+      } catch {
+        console.warn(`  ⚠️ WARN ${rel} JSON 无法解析，已跳过接线切除（文件未改动）。`);
+        continue;
+      }
+      if (!cfg || typeof cfg !== 'object' || !cfg.hooks || typeof cfg.hooks !== 'object') continue;
+      const hooks = cfg.hooks;
+      let removed = 0;
+      for (const e of HOOK_EVENTS) {
+        const key = host.schema === 'cursor' ? CURSOR_EVENT_KEYS[e.event] : e.event;
+        const list = hooks[key];
+        if (!Array.isArray(list)) continue;
+        if (host.schema === 'cursor') {
+          const kept = list.filter((entry) => {
+            const cmd = typeof entry === 'string' ? entry : (entry && entry.command);
+            if (typeof cmd === 'string' && cmdIsOurs(cmd, e.arg)) { removed++; return false; }
+            return true;
+          });
+          if (kept.length < list.length) {
+            if (kept.length) hooks[key] = kept; else delete hooks[key];
+          }
+        } else {
+          const keptGroups = [];
+          for (const group of list) {
+            if (!group || typeof group !== 'object' || !Array.isArray(group.hooks)) { keptGroups.push(group); continue; }
+            const keptHooks = group.hooks.filter((h) => {
+              if (h && typeof h === 'object' && typeof h.command === 'string' && cmdIsOurs(h.command, e.arg)) {
+                removed++;
+                return false;
+              }
+              return true;
+            });
+            // 组内仍有用户条目则保留（仅摘掉本包条目）；整组皆本包则丢整组。
+            if (keptHooks.length) keptGroups.push({ ...group, hooks: keptHooks });
+          }
+          if (keptGroups.length < list.length) {
+            if (keptGroups.length) hooks[key] = keptGroups; else delete hooks[key];
+          }
+        }
+      }
+      if (removed === 0) continue;
+      totalRemoved += removed;
+      if (Object.keys(hooks).length === 0) delete cfg.hooks;
+      if (Object.keys(cfg).length === 0) {
+        rmSync(abs, { force: true });
+        console.log(`  ✅ ${target.name}: 删除已清空的 ${rel}（含 ${removed} 条本包接线）`);
+      } else {
+        atomicWriteFileSync(abs, JSON.stringify(cfg, null, 2) + '\n');
+        console.log(`  ✅ ${target.name}: 从 ${rel} 精确切除 ${removed} 条本包 hook 接线（用户条目保留）`);
+      }
+    }
+  }
+  return totalRemoved;
+}
+
 function uninstall(isGlobal, force = false, toolName = null) {
   const baseDir = isGlobal ? homedir() : PROJECT_DIR;
   console.log(`\n  jevzh v${PKG.version} — jev-superpowers-zh 卸载（${isGlobal ? '全局' : '项目级'}${toolName ? `；仅 ${toolName}` : '；全部已装目标'}）\n`);
@@ -3900,6 +3995,7 @@ function uninstall(isGlobal, force = false, toolName = null) {
       totalSkills += removed;
     }
     uninstallHooksForTarget(target, baseDir);
+    pruneOurHookSettings(target, baseDir);
   }
 
   // 旧版 .claude/agents 残留（superpowers-zh v1.2.x）：仅全量卸载或 Claude 单工具卸载时处理。

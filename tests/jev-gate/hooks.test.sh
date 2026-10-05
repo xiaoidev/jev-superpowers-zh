@@ -182,7 +182,11 @@ CUR_OUT="$(node -e '
   ck(h.preToolUse[0].matcher==="Bash", "preToolUse matcher=Bash");
   for (const ev of ["sessionStart","preToolUse","stop"]){
     const cmd=h[ev][0].command;
-    const rel=cmd.split(/\s+/)[0].replace(/^\.\//,"");
+    // R-3：命令形态为 `node ./hooks/run-hook.cjs <arg>`，取 node 之后的脚本路径
+    const m=cmd.match(/^node\s+(\.\/\S+\.cjs)(?:\s+([a-z-]+))?$/);
+    ck(m, "node 启动器形态: "+cmd);
+    ck(m && ["session-start","pre-commit","stop"].includes(m[2]), "钩子参数合法: "+cmd);
+    const rel=m[1].replace(/^\.\//,"");
     ck(fs.existsSync(path.join(root,rel)), "命令路径存在: "+rel);
   }
   console.log("ok");

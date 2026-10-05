@@ -11,7 +11,7 @@ jev-superpowers-zh 以 [superpowers-zh](https://github.com/jnMetaCode/superpower
 
 ## 快速开始
 
-前置要求：**Node.js ≥ 20**。Windows 用户另需 **Git for Windows**（钩子经 `hooks/run-hook.cmd` 调 Git Bash 执行，WSL 也行但需其中自带 Node）。
+前置要求：**Node.js ≥ 20**。Windows 用户另需 **Git for Windows**（Claude 钩子经 `hooks/run-hook.cmd`、Cursor 钩子经 `hooks/run-hook.cjs` 调 Git Bash 执行；安装器优先识别固定路径的 Git Bash，不使用 WSL 存根）。
 
 ```bash
 # 项目级安装：自动检测当前目录用的是哪款工具，装 27 个技能 + hooks + .jevzh.json

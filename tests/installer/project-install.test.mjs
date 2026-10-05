@@ -10,8 +10,8 @@ import {
 } from './helpers.mjs';
 
 // R-1：hooks 运行时按宿主过滤，两套 schema 文件各归其主
-const CLAUDE_HOOK_RUNTIME = ['hooks.json', 'session-start', 'pre-commit', 'stop', 'run-hook.cmd'];
-const CURSOR_HOOK_RUNTIME = ['hooks-cursor.json', 'session-start', 'pre-commit', 'stop', 'run-hook.cmd'];
+const CLAUDE_HOOK_RUNTIME = ['hooks.json', 'session-start', 'pre-commit', 'stop', 'run-hook.cmd', 'run-hook.cjs'];
+const CURSOR_HOOK_RUNTIME = ['hooks-cursor.json', 'session-start', 'pre-commit', 'stop', 'run-hook.cmd', 'run-hook.cjs'];
 const GATE_SCRIPTS = ['jev-readiness', 'jev-gate', 'serve-laya.py'];
 
 test('Claude Code 项目级默认安装：27 技能 + 嵌套文件 + 哨兵 + hooks + 配置', () => {
@@ -102,6 +102,13 @@ test('Cursor 项目级安装：27 技能 + .cursor/hooks 落位', () => {
     for (const f of GATE_SCRIPTS) {
       assert.ok(exists(path.join(dir, '.cursor', 'scripts', f)), `缺少 .cursor/scripts/${f}`);
     }
+    // R-3：项目根相对 + node 启动器（宿主在项目根直生；旧 ./hooks/run-hook.cmd 是死路径）
+    const hookCfg = JSON.parse(readText(path.join(dir, '.cursor', 'hooks.json')));
+    const flat = JSON.stringify(hookCfg);
+    assert.match(flat, /node \.cursor\/hooks\/run-hook\.cjs session-start/);
+    assert.match(flat, /node \.cursor\/hooks\/run-hook\.cjs pre-commit/);
+    assert.match(flat, /node \.cursor\/hooks\/run-hook\.cjs stop/);
+    assert.doesNotMatch(flat, /\.\/hooks\/run-hook\.cmd/, 'R-3：不应再生成项目根解析不到的旧形态');
   } finally {
     rmFixture(dir);
   }

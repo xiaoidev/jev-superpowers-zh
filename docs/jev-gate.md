@@ -128,7 +128,7 @@
 
 | 钩子 | Claude（hooks.json） | Cursor（hooks-cursor.json，v1 小写） | 动作 |
 |---|---|---|---|
-| 会话开始 | SessionStart，matcher `startup\|clear\|compact`，经 `run-hook.cmd session-start` | sessionStart | 就绪提示与降级告知（每会话醒目一次，不静默降级） |
+| 会话开始 | SessionStart，matcher `startup\|clear\|compact`，经 `run-hook.cmd session-start` | sessionStart，经 `node .cursor/hooks/run-hook.cjs session-start` | 就绪提示与降级告知（每会话醒目一次，不静默降级） |
 | 命令前 | PreToolUse，matcher `Bash` → `hooks/pre-commit` | preToolUse（同） | 仅 `git commit` / `git push` 进门，其余 exit 0 快路径 |
 | 停止 | Stop（matcher 空）→ `hooks/stop` | stop | 三段收束检查 |
 
@@ -155,5 +155,5 @@
 | 云端不生效 | 确认 `TYPESAFE_API_KEY` 非空且不为 `local`；网络可达 `https://api.typesafe.ai/`（探测 2 秒超时） |
 | `pick` 返回 exit 3 | 这是人工破平区间，不是错误：由人类权衡后显式决定继续或补需求 |
 | commit 门被挡但看不到原因 | 手动跑 `git jev check` 与 `bash scripts/jev-gate commit` 看完整输出；缺 `[PASS]` 一律先修 |
-| 钩子在 Windows 不触发 | 确认装了 Git for Windows，钩子经 `hooks/run-hook.cmd` → Git Bash 执行；Node 需 ≥ 20 |
+| 钩子在 Windows 不触发 | 确认装了 Git for Windows：Claude 钩子经 `hooks/run-hook.cmd`、Cursor 项目钩子（宿主在项目根执行）经 `node .cursor/hooks/run-hook.cjs` → Git Bash，两个启动器都优先探测 `C:\Program Files\Git\bin\bash.exe`，拒绝 WSL 存根；Node 需 ≥ 20 |
 | 怀疑读到旧状态 | 删临时目录的 `jevzh-*.state`，或不带 `--cached` 重跑就绪检测 |
