@@ -1,5 +1,6 @@
 import assert from "node:assert/strict";
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { spawnSync } from "node:child_process";
 import test from "node:test";
@@ -120,15 +121,89 @@ test("sync 脚本 --check 与 package.json 一致时 exit 0", () => {
   assert.equal(r.status, 0, `--check stderr:\n${r.stderr}\n${r.stdout}`);
 });
 
-test("sync 脚本 --check 发现漂移时 exit 1 且不写盘", () => {
-  // 用临时副本仓库无法做到（TARGETS 按脚本自身位置解析），改为直接校验
-  // 未知参数 exit 64，保证 CI 拼错参数不会静默通过。
-  const r = spawnSync(
-    process.execPath,
-    ["scripts/sync-plugin-version.js", "--write"],
-    { cwd: root, encoding: "utf8" },
+test("sync --check 真实漂移：exit 1 不写盘，写入模式同步全部 6 个清单", () => {
+  // 通过 --root 在临时副本里跑：脚本支持 --root <dir> 后，清单根可指向任意目录。
+  // node --test 会并发跑多个测试文件，篡改仓内清单会与其他文件竞争且污染工作树；
+  // 每个用例独占一个 mkdtemp 目录，天然并发安全，finally 清理后不留痕迹。
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "jevzh-sync-"));
+  const script = path.join(root, "scripts", "sync-plugin-version.js");
+  const run = (extraArgs) =>
+    spawnSync(
+      process.execPath,
+      [script, ...extraArgs, "--root", tmp],
+      { cwd: root, encoding: "utf8" },
+    );
+  try {
+    // package.json 升到 9.9.9，6 个清单全部停留在 0.0.1（构造真实漂移）
+    fs.writeFileSync(
+      path.join(tmp, "package.json"),
+      `${JSON.stringify({ version: "9.9.9" }, null, 2)}\n`,
+    );
+    const seed = {
+      ".claude-plugin/plugin.json": { version: "0.0.1" },
+      ".cursor-plugin/plugin.json": { version: "0.0.1" },
+      ".codex-plugin/plugin.json": { version: "0.0.1" },
+      ".kimi-plugin/plugin.json": { version: "0.0.1" },
+      "gemini-extension.json": { version: "0.0.1" },
+      ".claude-plugin/marketplace.json": {
+        plugins: [{ name: "jev-superpowers-zh", version: "0.0.1" }],
+      },
+    };
+    for (const [rel, json] of Object.entries(seed)) {
+      fs.mkdirSync(path.join(tmp, path.dirname(rel)), { recursive: true });
+      fs.writeFileSync(path.join(tmp, rel), `${JSON.stringify(json, null, 2)}\n`);
+    }
+
+    // 1) --check：有漂移 exit 1，且清单保持篡改后的 0.0.1（校验模式绝不写盘）
+    const check = run(["--check"]);
+    assert.equal(
+      check.status,
+      1,
+      `漂移时应 exit 1\nstdout:${check.stdout}\nstderr:${check.stderr}`,
+    );
+    for (const [rel] of VERSIONED_MANIFESTS) {
+      const text = fs.readFileSync(path.join(tmp, rel), "utf8");
+      assert.ok(text.includes("0.0.1"), `${rel}: --check 不得改写文件`);
+      assert.ok(!text.includes("9.9.9"), `${rel}: --check 不得改写文件`);
+    }
+
+    // 2) 写入模式：exit 0，6 个清单全部同步到 package.json 的 9.9.9
+    const write = run([]);
+    assert.equal(
+      write.status,
+      0,
+      `写入模式应 exit 0\nstdout:${write.stdout}\nstderr:${write.stderr}`,
+    );
+    for (const [rel, getVersion] of VERSIONED_MANIFESTS) {
+      const json = JSON.parse(fs.readFileSync(path.join(tmp, rel), "utf8"));
+      assert.equal(getVersion(json), "9.9.9", `${rel}: 写入模式应同步版本`);
+    }
+
+    // 3) 同步后再 --check：exit 0
+    const recheck = run(["--check"]);
+    assert.equal(recheck.status, 0, `同步后应一致 exit 0\nstderr:${recheck.stderr}`);
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("sync 脚本拒绝未知参数、缺值 --root 与无 package.json 的根（exit 64）", () => {
+  const spawn = (args) =>
+    spawnSync(process.execPath, ["scripts/sync-plugin-version.js", ...args], {
+      cwd: root,
+      encoding: "utf8",
+    });
+
+  // 未知参数 exit 64，保证 CI 拼错参数不会静默通过
+  assert.equal(spawn(["--write"]).status, 64);
+  // --root 必须带目录值
+  assert.equal(spawn(["--root"]).status, 64);
+  // --root 指向不存在 package.json 的目录也是用法错误（64），而非未捕获异常（1）
+  const missing = path.join(
+    os.tmpdir(),
+    `jevzh-sync-missing-${process.pid}-${Date.now()}`,
   );
-  assert.equal(r.status, 64);
+  assert.equal(spawn(["--check", "--root", missing]).status, 64);
 });
 
 // ---------------------------------------------------------------------------
@@ -163,6 +238,61 @@ test("files 数组每个条目在仓内都有实物", () => {
 test("main 与 index.js 指向的 opencode 插件实物存在", () => {
   assert.ok(exists(pkg.main), `main 悬空: ${pkg.main}`);
   assert.ok(exists("index.js"));
+});
+
+// 反向断言：关键分发根缺一个都不行（files 只能收窄，不能漏掉运行时必需品）。
+test("files 必须包含关键分发根，pkg.bin 目标与各 glob 实物齐备", () => {
+  const requiredEntries = [
+    "bin/",
+    "scripts/",
+    "hooks/",
+    "skills/",
+    ".opencode/",
+    ".pi/extensions/",
+    ".claude-plugin/",
+    ".cursor-plugin/",
+    ".codex-plugin/",
+    ".kimi-plugin/",
+    ".codex/INSTALL.md",
+    "gemini-extension.json",
+    ".jevzh.json.example",
+    "docs/*.md",
+  ];
+  for (const entry of requiredEntries) {
+    assert.ok(pkg.files.includes(entry), `files 缺少关键分发条目: ${entry}`);
+  }
+
+  // pkg.bin 的 jevzh 命令必须指向仓内真实文件
+  assert.equal(pkg.bin?.jevzh, "bin/jevzh.js");
+  assert.ok(exists(pkg.bin.jevzh), `bin 目标悬空: ${pkg.bin.jevzh}`);
+
+  // 六个版本化插件清单实物都在（由上面的目录/文件条目覆盖进发布包）
+  for (const [rel] of VERSIONED_MANIFESTS) {
+    assert.ok(exists(rel), `版本化清单实物缺失: ${rel}`);
+  }
+
+  // 每个 glob 条目至少命中一个实文件（files 写了 glob 但零命中等于漏发）
+  for (const entry of pkg.files.filter((f) => f.includes("*"))) {
+    const m = /^(.+)\/\*(\.[^/]+)$/.exec(entry);
+    assert.ok(m, `不支持的 glob 形式: ${entry}`);
+    const [, dir, ext] = m;
+    const hits = fs
+      .readdirSync(path.join(root, dir), { withFileTypes: true })
+      .filter((d) => d.isFile() && d.name.endsWith(ext));
+    assert.ok(hits.length > 0, `${entry}: glob 未命中任何实文件`);
+  }
+
+  // skills/ 整目录发布：必须恰好 27 个技能（21 中文 + 6 jev-*），每个带 SKILL.md
+  const skillDirs = fs
+    .readdirSync(path.join(root, "skills"), { withFileTypes: true })
+    .filter((d) => d.isDirectory());
+  assert.equal(skillDirs.length, 27, "skills 应分发 27 个技能目录");
+  for (const d of skillDirs) {
+    assert.ok(
+      exists(path.join("skills", d.name, "SKILL.md")),
+      `skills/${d.name} 缺 SKILL.md`,
+    );
+  }
 });
 
 test("files 不收 tests/、.jevzh/、docs/superpowers/", () => {

@@ -46,12 +46,17 @@ npx jevzh --global --tool windsurf
 
 也就是说：**如果你已经为 Antigravity（`.agents/skills`）或 Claude Code 装过，Windsurf 其实已经能读到**，不必重复装 —— 否则会加载两份。
 
-## Skill 加载优先级
+## Skill 加载位置（三个范围）
 
-| 位置 | 优先级 | 说明 |
-|------|--------|------|
-| `.windsurf/skills/` | 最高 | 项目级，仅当前项目 |
-| `~/.windsurf/skills/` | 中 | 用户级，所有项目共享 |
+[官方文档](https://docs.windsurf.com/windsurf/cascade/skills)把 Skills 分成 Workspace / Global / System 三个范围，jevzh 只装前两个：
+
+| 范围 | 路径 | 可见性 / jevzh 入口 |
+|------|------|------|
+| Workspace（项目级） | `.windsurf/skills/<skill-name>/` | 仅当前 workspace，随仓库提交；`npx jevzh --tool windsurf` |
+| Global（用户级） | `~/.codeium/windsurf/skills/<skill-name>/`（Windows 即 `%USERPROFILE%\.codeium\windsurf\skills\`） | 本机所有 workspace，不提交；`npx jevzh --global --tool windsurf` |
+| System（企业统发） | macOS `/Library/Application Support/Windsurf/skills/`、Linux/WSL `/etc/windsurf/skills/`、Windows `C:\ProgramData\Windsurf\skills\` | IT 下发、只读，jevzh 不安装到这里 |
+
+> 📌 **不存在 `~/.windsurf/skills/` 这个用户级目录**，Windsurf 不读它 —— 别在那儿手动放技能。官方文档没有规定同名 skill 在多个范围同时存在时的覆盖优先级，因此请勿重复安装；`.agents/skills/` 等跨 Agent 兼容位置见上文「跨工具发现」。
 
 ## 使用
 

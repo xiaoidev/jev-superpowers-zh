@@ -14,7 +14,12 @@ cd /your/project
 npx jevzh
 ```
 
-安装脚本会自动检测 `.github/` 目录并将 skills 复制到该目录。
+安装脚本不是看到 `.github/` 目录就动作，而是只认两个 **Copilot 配置标记**中的任意一个：
+
+- `.github/copilot-instructions.md` 文件，或
+- `.github/instructions/` 目录
+
+命中后把 skills 复制到 `.github/superpowers/`，并生成 `.github/instructions/jevzh.instructions.md` 索引。空有 `.github/` 目录（两个标记都不存在）不会触发自动安装 —— 那时显式指定工具即可：`npx jevzh --tool vscode`。
 
 ## 手动安装
 

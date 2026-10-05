@@ -6,22 +6,47 @@
 //   node scripts/sync-plugin-version.js          写入模式：把差异刷进各清单
 //   node scripts/sync-plugin-version.js --check  校验模式：只报告差异，不写盘；
 //                                                全部一致 exit 0，有差异 exit 1
+//   node scripts/sync-plugin-version.js --root <dir>
+//                                                指定清单根目录（默认仓根）；
+//                                                供测试在临时副本上跑漂移检查
 //
 // 设计：用 regex 替换而不是 JSON.parse + stringify，目的是保留原文件格式
 // （缩进、行内/多行数组、空白等不被破坏）。每种 field 路径对应一个专用 regex。
-import { readFileSync, writeFileSync } from 'fs';
+import { existsSync, readFileSync, writeFileSync } from 'fs';
 import { resolve, dirname } from 'path';
 import { fileURLToPath } from 'url';
 
+const USAGE = '用法: node scripts/sync-plugin-version.js [--check] [--root <dir>]';
+
 const args = process.argv.slice(2);
-const checkOnly = args.includes('--check');
-if (args.some((a) => a !== '--check')) {
-  console.error(`用法: node scripts/sync-plugin-version.js [--check]`);
-  process.exit(64);
+let checkOnly = false;
+let rootArg = null;
+for (let i = 0; i < args.length; i++) {
+  const arg = args[i];
+  if (arg === '--check') {
+    checkOnly = true;
+  } else if (arg === '--root') {
+    if (i + 1 >= args.length) {
+      console.error('错误: --root 需要一个目录参数');
+      console.error(USAGE);
+      process.exit(64);
+    }
+    rootArg = args[++i];
+  } else {
+    console.error(`未知参数: ${arg}`);
+    console.error(USAGE);
+    process.exit(64);
+  }
 }
 
-const root = resolve(dirname(fileURLToPath(import.meta.url)), '..');
-const pkg = JSON.parse(readFileSync(resolve(root, 'package.json'), 'utf8'));
+const defaultRoot = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const root = rootArg ? resolve(rootArg) : defaultRoot;
+const pkgPath = resolve(root, 'package.json');
+if (!existsSync(pkgPath)) {
+  console.error(`错误: ${pkgPath} 不存在（--root 必须指向含 package.json 与各清单的目录）`);
+  process.exit(64);
+}
+const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'));
 
 // targets 字段对齐 .version-bump 约定（path + field 路径）。
 // 顶层用 "version"，嵌套用 dot-path（如 "plugins.0.version"）。
