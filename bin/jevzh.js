@@ -1617,11 +1617,24 @@ function cmdIsOurs(cmd, arg) {
   const n = normCmd(cmd);
   return /run-hook\.(cmd|cjs|js)(\s|$|["'])/.test(n) && n.includes(arg);
 }
-function cmdIsCompetitorJev(cmd) {
+// event 显式给出时（merge 遍历中始终给出）以【条目所在事件键】为事件归属权威：
+// 竞品条目内嵌的脚本名可能挂错键（畸形配置，如 hooks/stop 挂在 PreToolUse 下），
+// 只按字符串反推会把它改写成 stop 接线却留在 PreToolUse 键内，卸载按所在键
+// 配的 pre-commit 反配就会漏切这条死命令。无 event 上下文的调用保留旧反推逻辑。
+function cmdIsCompetitorJev(cmd, event = null) {
   const n = normCmd(cmd);
   if (!/(^|[^A-Za-z0-9-])jev-superpowers(?=\/|$|[^A-Za-z0-9-])/.test(n)) return null;
+  if (event) return event;
   for (const e of HOOK_EVENTS) if (n.includes(e.arg)) return e.event;
   return null;
+}
+
+// 卸载剪枝专用：只认本包启动器名（run-hook.cmd/cjs/js），不约束内嵌脚本名。
+// 事件归属以条目实际所在键为准——旧安装器按字符串反推改写过的畸形条目
+// （如 PreToolUse 键内嵌 stop 脚本名）同样必须在其所在键下被切除，否则
+// 会在用户配置里留下每次工具调用都 127 的死命令。
+function cmdIsOurHookEntry(cmd) {
+  return /run-hook\.(cmd|cjs|js)(\s|$|["'])/.test(normCmd(cmd));
 }
 
 // 遍历两种 schema 下的 command 字符串：fn(commandString, event, entry, group)
@@ -1695,11 +1708,12 @@ function mergeHooksConfig(cfg0, schema, hooksAbsDir, hooksRel = '.cursor/hooks')
   if (!cfg.hooks || typeof cfg.hooks !== 'object') cfg.hooks = {};
   const rewrites = [];
   walkHookCommands(cfg, schema, (cmd, event, hookEntry) => {
-    const jevEvent = cmdIsCompetitorJev(cmd);
-    if (jevEvent) {
-      const arg = HOOK_EVENTS.find(e => e.event === jevEvent).arg;
+    // R3：竞品条目改写成哪个脚本由【当前遍历的事件键】决定，不信任条目内嵌
+    // 脚本名（挂错键的畸形配置按字符串反推会改写/剪枝不对称而漏切）。
+    if (cmdIsCompetitorJev(cmd, event)) {
+      const arg = HOOK_EVENTS.find(e => e.event === event).arg;
       hookEntry.command = oursHookCommand(hooksAbsDir, schema, arg, hooksRel);
-      rewrites.push(jevEvent);
+      rewrites.push(event);
       return true;
     }
     if (schema === 'cursor') {
@@ -1916,7 +1930,10 @@ function printPlanMatrix(plan, opts) {
     } else if (h.status === 'keep') {
       console.log(`  [SKIP]    ${h.candidates[0]}：--keep-router 不做 hooks 接线合并`);
     } else if (h.status === 'rewrite') {
-      console.log(`  [MIGRATE] ${h.chosen}：检测到 jev-superpowers 旧 hooks 引用，将备份后改写为本包 run-hook.cmd 接线`);
+      // R1：启动器文件名按宿主实际接线形态——Claude 走 run-hook.cmd（宿主以
+      // bash 执行），Cursor 走 node run-hook.cjs（项目根直生，见 oursHookCommand）。
+      const launcher = h.schema === 'cursor' ? 'run-hook.cjs（node 启动）' : 'run-hook.cmd';
+      console.log(`  [MIGRATE] ${h.chosen}：检测到 jev-superpowers 旧 hooks 引用，将备份后改写为本包 ${launcher} 接线`);
     } else if (h.status === 'merge') {
       console.log(`  [MIGRATE] ${h.chosen}：hooks 接线读改写合并（保留未知键与既有 hook 条目，不重复追加），改前备份`);
     } else if (h.status === 'wired') {
@@ -3899,7 +3916,7 @@ function pruneOurHookSettings(target, baseDir) {
         if (host.schema === 'cursor') {
           const kept = list.filter((entry) => {
             const cmd = typeof entry === 'string' ? entry : (entry && entry.command);
-            if (typeof cmd === 'string' && cmdIsOurs(cmd, e.arg)) { removed++; return false; }
+            if (typeof cmd === 'string' && cmdIsOurHookEntry(cmd)) { removed++; return false; }
             return true;
           });
           if (kept.length < list.length) {
@@ -3907,19 +3924,27 @@ function pruneOurHookSettings(target, baseDir) {
           }
         } else {
           const keptGroups = [];
+          // I-1：写回判定必须按「组内容是否变化」而不仅是「组数是否变化」。
+          // 同组混装（本包条目 + 用户条目）时只摘本组本包条目、组仍保留，
+          // 组数不变；旧条件 keptGroups.length < list.length 为假导致整段
+          // 不回写——死命令留在 JSON 里每次工具调用都 127，日志却谎报已切除。
+          let groupChanged = false;
           for (const group of list) {
             if (!group || typeof group !== 'object' || !Array.isArray(group.hooks)) { keptGroups.push(group); continue; }
             const keptHooks = group.hooks.filter((h) => {
-              if (h && typeof h === 'object' && typeof h.command === 'string' && cmdIsOurs(h.command, e.arg)) {
+              if (h && typeof h === 'object' && typeof h.command === 'string' && cmdIsOurHookEntry(h.command)) {
                 removed++;
                 return false;
               }
               return true;
             });
             // 组内仍有用户条目则保留（仅摘掉本包条目）；整组皆本包则丢整组。
-            if (keptHooks.length) keptGroups.push({ ...group, hooks: keptHooks });
+            if (keptHooks.length) {
+              if (keptHooks.length !== group.hooks.length) groupChanged = true;
+              keptGroups.push({ ...group, hooks: keptHooks });
+            }
           }
-          if (keptGroups.length < list.length) {
+          if (groupChanged || keptGroups.length < list.length) {
             if (keptGroups.length) hooks[key] = keptGroups; else delete hooks[key];
           }
         }
