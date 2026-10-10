@@ -1,0 +1,30 @@
+# Scripts and docs are always LF, even on Windows checkouts.
+
+# Shell scripts and extensionless entry scripts shipped with skills
+*.sh text eol=lf
+skills/*/scripts/* text eol=lf
+# jev 门禁入口为无扩展名 bash 脚本（CRLF 会破坏 shebang）
+scripts/jev-* text eol=lf
+# 本地 Laya 桥（经 python3 解释器调用，LF 必须保证）
+*.py text eol=lf
+# 钩子：无扩展名 bash 脚本 + polyglot run-hook.cmd（CRLF 会破坏 shebang/batch 解析）
+hooks/* text eol=lf
+
+# Documentation
+*.md text eol=lf
+
+# Source and config files
+*.json text eol=lf
+*.example text eol=lf
+*.js text eol=lf
+*.mjs text eol=lf
+*.cjs text eol=lf
+*.ts text eol=lf
+*.html text eol=lf
+*.svg text eol=lf
+*.dot text eol=lf
+
+# Root text files without an extension
+LICENSE text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf

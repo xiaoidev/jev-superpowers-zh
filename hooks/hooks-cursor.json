@@ -1,0 +1,21 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "node ./hooks/run-hook.cjs session-start"
+      }
+    ],
+    "preToolUse": [
+      {
+        "matcher": "Bash",
+        "command": "node ./hooks/run-hook.cjs pre-commit"
+      }
+    ],
+    "stop": [
+      {
+        "command": "node ./hooks/run-hook.cjs stop"
+      }
+    ]
+  }
+}

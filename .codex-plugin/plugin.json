@@ -1,0 +1,50 @@
+{
+  "name": "jev-superpowers-zh",
+  "version": "0.1.0",
+  "description": "中文 AI 编程方法论 + 6 个 jev 门禁技能：头脑风暴、subagent 驱动开发、规划、TDD、调试、代码审查、收尾工作流，以及 jev 门禁（置信度路由/假设检验/提交守卫/就绪降级）。",
+  "author": {
+    "name": "jev-superpowers-zh contributors",
+    "url": "https://github.com/xiaoidev"
+  },
+  "homepage": "https://github.com/xiaoidev/jev-superpowers-zh",
+  "repository": "https://github.com/xiaoidev/jev-superpowers-zh",
+  "license": "MIT",
+  "keywords": [
+    "brainstorming",
+    "subagent-driven-development",
+    "skills",
+    "planning",
+    "tdd",
+    "debugging",
+    "code-review",
+    "workflow",
+    "chinese",
+    "中文",
+    "jev",
+    "jevzh"
+  ],
+  "skills": "./skills/",
+  "hooks": {},
+  "interface": {
+    "displayName": "Jev Superpowers 中文版",
+    "shortDescription": "面向编程 agent 的规划、TDD、调试、交付工作流（中文 + jev 门禁版）",
+    "longDescription": "引导 agent 完成头脑风暴、实现规划、测试驱动开发、系统化调试、并行执行、代码审查与分支收尾；在中文方法论之上叠加 6 个汉化 jev 门禁技能（置信度路由、假设检验、提交守卫、质量门、就绪探测与软降级），共 27 个技能。",
+    "developerName": "jev-superpowers-zh contributors",
+    "category": "Developer Tools",
+    "capabilities": [
+      "Interactive",
+      "Read",
+      "Write"
+    ],
+    "defaultPrompt": [
+      "我有个想做的东西。",
+      "给这个项目加个功能。"
+    ],
+    "websiteURL": "https://github.com/xiaoidev/jev-superpowers-zh",
+    "privacyPolicyURL": "https://docs.github.com/en/site-policy/privacy-policies/github-general-privacy-statement",
+    "termsOfServiceURL": "https://docs.github.com/en/site-policy/github-terms/github-terms-of-service",
+    "brandColor": "#F59E0B",
+    "composerIcon": "./assets/superpowers-small.svg",
+    "screenshots": []
+  }
+}

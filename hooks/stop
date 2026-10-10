@@ -1,0 +1,137 @@
+#!/usr/bin/env bash
+# Stop-hook verification gate — jev-superpowers-zh 软降级版
+#
+# 三段检查：
+#   1. 工作区有未提交变更（git status --porcelain 非空）
+#   2. ./scripts/test.sh 存在且执行失败
+#   3. limpet 收束门（经 scripts/jev-gate limpet）
+# 前两段仅在 git 仓库内执行，属环境/执行状态：strict 中文 stderr + exit 2，
+# soft 降级为 WARN + 继续。limpet 门始终执行：判定型否决（limpet 可用但结论
+# 否决）即使 soft 也 exit 2；limpet 环境缺失时由 jev-gate 按 strict/soft 分流。
+# strict/soft 纯本地判定（与 pre-commit 同口径）：JEVZH_STRICT(env) >
+# .jevzh.json strict > 默认 soft；不读 --cached 缓存——避免 soft→strict 切换
+# 后存在缓存 TTL 滞后窗口（stop 在会话结束才触发，错放一次即不可追）；
+# 也不做任何工具/后端探测。node 缺失/配置损坏按 soft（仅影响前两段本地检查，
+# limpet 门由 jev-gate 自行实探，判定型否决始终 exit 2）。
+#
+# S-3：strict 不再命中第一个就退出——依次跑完三段，收集全部命中项后统一
+# stderr 输出一次并 exit 2（soft 的逐条 WARN 聚合现状不变）。
+# S-1：limpet 门经 30s 超时包装：超时属环境型——soft WARN exit 0，strict exit 2
+# （正常返回的 limpet 判定型否决在任何模式下仍 exit 2）。
+# 依据：spec §5.4、§4.3。
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_DIR="${PWD:-.}"
+
+# ---------------------------------------------------------------------------
+# 跨平台超时包装（S-1）：优先 timeout（Git for Windows / Linux 自带），
+# 其次 gtimeout（macOS coreutils），都没有则裸执行（保持现状）。
+# JEVZH_HOOK_TIMEOUT（秒）可覆盖默认阈值，仅供宿主自调/测试加速。
+# 用法：run_to <秒> <命令...>；超时返回 124（被 -9 收割时 137）。
+# ---------------------------------------------------------------------------
+JEVZH_TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then
+    JEVZH_TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+    JEVZH_TIMEOUT_BIN="gtimeout"
+fi
+run_to() {
+    local secs="$1"; shift
+    [ -n "${JEVZH_HOOK_TIMEOUT:-}" ] && secs="$JEVZH_HOOK_TIMEOUT"
+    if [ -n "$JEVZH_TIMEOUT_BIN" ]; then
+        "$JEVZH_TIMEOUT_BIN" "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+is_timeout_rc() { [ "$1" = "124" ] || [ "$1" = "137" ]; }
+
+# limpet 门实际生效的超时秒数（仅用于对外文案；run_to 内部自行解析覆盖）。
+LIMPET_TIMEOUT_SECS="${JEVZH_HOOK_TIMEOUT:-30}"
+
+STRICT="$(PROJECT_DIR="$PROJECT_DIR" node -e '
+  const fs = require("fs"), path = require("path");
+  const truthy = v => ["1","true","yes","on"].includes(String(v).toLowerCase());
+  let s = "0";
+  if (process.env.JEVZH_STRICT !== undefined) {
+    s = truthy(process.env.JEVZH_STRICT) ? "1" : "0";
+  } else {
+    try {
+      const j = JSON.parse(fs.readFileSync(path.join(process.env.PROJECT_DIR, ".jevzh.json"), "utf8"));
+      if (j !== null && typeof j === "object" && j.strict !== undefined && j.strict !== null
+          && truthy(j.strict)) s = "1";
+    } catch (e) { /* 配置缺失/损坏：默认 soft */ }
+  }
+  process.stdout.write(s);
+' 2>/dev/null || printf '0')"
+[ "$STRICT" = "1" ] || STRICT=0
+
+IN_REPO=0
+if command -v git >/dev/null 2>&1 && git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+    IN_REPO=1
+fi
+
+# 本地状态类问题收集（S-3）：
+#   soft：逐条 WARN 后继续（保持原聚合行为）；
+# strict：只收集不退出，三段跑完统一输出并 exit 2。
+PROBLEM_COUNT=0
+PROBLEM_LIST=""
+note_local_problem() { # $1=中文说明
+    if [ "$STRICT" = "1" ]; then
+        PROBLEM_COUNT=$((PROBLEM_COUNT + 1))
+        PROBLEM_LIST="${PROBLEM_LIST}  - $1"$'\n'
+    else
+        echo "WARN stop：$1（软降级放行，不代表检查通过）。" >&2
+    fi
+}
+
+if [ "$IN_REPO" = "1" ]; then
+    if [ -n "$(git status --porcelain 2>/dev/null)" ]; then
+        note_local_problem "工作区仍有未提交变更，请先提交或 stash 后再结束"
+    fi
+
+    if [ -f "./scripts/test.sh" ]; then
+        if ! bash ./scripts/test.sh >/dev/null 2>&1; then
+            note_local_problem "./scripts/test.sh 执行失败，请先修复后再结束"
+        fi
+    fi
+fi
+
+# limpet 收束门：经 jev-gate 执行（S-1：30s 封顶）。判定否决（含 soft）一律
+# exit 2；环境缺失 soft 时 jev-gate 已打印 [门禁降级] 并 exit 0。
+LIMPET_TIMED_OUT=0
+out="$(run_to 30 bash "$PLUGIN_ROOT/scripts/jev-gate" --project "$PROJECT_DIR" limpet 2>&1)"
+rc=$?
+printf '%s\n' "$out"
+
+if is_timeout_rc "$rc"; then
+    LIMPET_TIMED_OUT=1
+    if [ "$STRICT" = "1" ]; then
+        PROBLEM_COUNT=$((PROBLEM_COUNT + 1))
+        PROBLEM_LIST="${PROBLEM_LIST}  - limpet 收束门禁超时（${LIMPET_TIMEOUT_SECS}s 无响应，按环境型失败处理）"$'\n'
+    else
+        echo "WARN stop：limpet 收束门禁超时（${LIMPET_TIMEOUT_SECS}s），软降级放行（环境型失败，不代表检查通过）。" >&2
+    fi
+elif [ "$rc" -ne 0 ]; then
+    if [ "$STRICT" = "1" ]; then
+        PROBLEM_COUNT=$((PROBLEM_COUNT + 1))
+        PROBLEM_LIST="${PROBLEM_LIST}  - limpet 收束门禁未通过（详见上方 jev-gate 输出）"$'\n'
+    else
+        # soft 下 limpet 判定型否决仍不软放行
+        echo "stop：limpet 收束门禁未通过（exit 2），结束被阻止；详见上方 jev-gate 输出。" >&2
+        exit 2
+    fi
+fi
+
+# S-3：strict 汇总本次所有命中项，统一输出一次。
+if [ "$STRICT" = "1" ] && [ "$PROBLEM_COUNT" -gt 0 ]; then
+    {
+        echo "stop：严格模式下发现 ${PROBLEM_COUNT} 项阻断问题（exit 2），请逐项处理后再结束："
+        printf '%s' "$PROBLEM_LIST"
+    } >&2
+    exit 2
+fi
+
+exit 0

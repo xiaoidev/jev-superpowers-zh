@@ -1,0 +1,73 @@
+{
+  "version": 1,
+  "description": "jev-superpowers-zh 双上游整合的已登记差异。divergences 为规格 §8.1 第 4 条权威定义的 4 项合并衍件：这些文件既不是 zh 上游的镜像、也不是 jev 上游的镜像，双上游审计只做欠同步 WARN，不做逐字一致 FAIL。whitelist 为规格 §8.1 第 2 条的保真白名单：品牌替换与 jev 技能汉化属于有意分歧，由 audit.sh 的归一化比对与契约保真检查吸收。每次与上游同步后若新增/删除差异，必须同步更新本文件与 .upstream-sync.json。",
+  "divergences": [
+    {
+      "id": "merged-hook-manifests",
+      "scope": [
+        "hooks/hooks.json",
+        "hooks/hooks-cursor.json"
+      ],
+      "upstream": "zh+jev",
+      "reason": "zh 上游只有 SessionStart 单道钩子，jev 上游是 pre-commit/session-start/stop 三道；本仓两份 hooks manifest 是按 jevzh 形态合并出的衍件，不属任一源的镜像，无法逐字对齐。审计只在对应上游发布新版时报欠同步 WARN。",
+      "sourceText": "hooks/hooks.json 与 hooks/hooks-cursor.json 为 jevzh 合并衍件（zh 仅 SessionStart，jev 三道），不属任一源的镜像"
+    },
+    {
+      "id": "session-start-zh-base-jev-injection",
+      "scope": [
+        "hooks/session-start"
+      ],
+      "upstream": "zh",
+      "reason": "以 zh 版 session-start 为基座，有意改为注入 jev-using-superpowers 路由技能并追加 jev-readiness 就绪探测段；不再是 zh 原文件的镜像，只报欠同步 WARN。",
+      "sourceText": "hooks/session-start 以 zh 版为基座，有意改注入 jev-using-superpowers + 就绪段"
+    },
+    {
+      "id": "jev-hooks-soft-degrade",
+      "scope": [
+        "hooks/pre-commit",
+        "hooks/stop"
+      ],
+      "upstream": "jev",
+      "reason": "迁自 jev 上游的两道钩子，有意加入门禁工具/后端缺失时软降级（WARN + 放行）分支与 jev-gate 路径接线，不是 jev 原文件的镜像，只报欠同步 WARN。",
+      "sourceText": "hooks/pre-commit、hooks/stop 迁自 jev，有意加软降级分支"
+    },
+    {
+      "id": "installer-fork-rebrand",
+      "scope": [
+        "bin/jevzh.js"
+      ],
+      "upstream": "zh",
+      "reason": "fork 自 zh 的 bin/superpowers-zh.js，有意改品牌（jev-superpowers-zh/jevzh）、新增 --no-jev/--strict/--adopt-skills/--keep-router/--detect-only 等共存参数与 jev hooks 安装逻辑，规格已声明 27 技能/26 目标，不做逐字镜像 FAIL。",
+      "sourceText": "bin/jevzh.js fork 自 zh bin/superpowers-zh.js，有意改品牌/参数/钩子安装"
+    }
+  ],
+  "whitelist": [
+    {
+      "id": "zh-brand-self-reference",
+      "scope": [
+        "skills/*/SKILL.md",
+        "skills/*/**/*.md"
+      ],
+      "upstream": "zh",
+      "reason": "21 个 zh 技能正文中的品牌自指 superpowers-zh 统一替换为 jev-superpowers-zh；jnMetaCode/superpowers-zh 归属 URL 保留原文。audit.sh 保真比对对两侧对称套用同一归一化规则，替换本身不计漂移。"
+    },
+    {
+      "id": "npx-command-rename",
+      "scope": [
+        "skills/*/SKILL.md",
+        "skills/*/**/*.md",
+        "docs/README.*.md"
+      ],
+      "upstream": "zh",
+      "reason": "安装命令 npx superpowers-zh 统一改名为 npx jevzh，属于规格声明的品牌替换白名单；保真比对归一化处理，不计漂移。"
+    },
+    {
+      "id": "jev-skills-localized",
+      "scope": [
+        "skills/jev-*/SKILL.md"
+      ],
+      "upstream": "jev",
+      "reason": "6 个 jev-* 技能的叙述性文本汉化为中文，结构性标题按 ±3 容差对齐；逐字保真仅强制规格 §8.1 第 3 条的 23 个契约 token（命令/参数/阈值/env/端点），其余文本差异不 FAIL。"
+    }
+  ]
+}

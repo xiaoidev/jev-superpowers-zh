@@ -1,0 +1,206 @@
+#!/usr/bin/env bash
+# PreToolUse gate for git commit / git push — jev-superpowers-zh 软降级版
+#
+# stdin 判定（I-1：禁止用 grep 直接抠 JSON 字段，转义引号/pretty 打印都会绕过）：
+#   1. 最多读 1MB+1 字节（S-4）：读到第 1048577 字节即超限 → fail-closed 进门；
+#   2. 空 stdin：回落门禁（与上游一致）；
+#   3. 廉价预筛：载荷含 commit/push 字样才继续，否则 exit 0（非提交快路径）；
+#   4. node JSON.parse 取 tool_input.command（缺省回落顶层 command），先折叠
+#      shell 反斜杠续行（"\<LF>"，I-2），再对解码后字符串做 git 提交/推送
+#      语义正则；node 缺失/JSON 损坏/字段类型异常且预筛命中时一律 fail-closed
+#      进门（exit 2 不可判定也进门）。
+# 命中提交命令后经统一入口 scripts/jev-gate commit 执行 git jev check：
+#   - 环境型失败（工具缺失/后端不可达/git 缺失）：soft 中文 WARN 后 exit 0，
+#     strict exit 2；
+#   - 判定型失败（输出无 [PASS]）：jev-gate exit 2，任何模式都不软放行。
+# strict 判定（S-2）：纯本地 node 读 JEVZH_STRICT(env) > .jevzh.json strict，
+#   不为 strict 做任何工具/后端探测；同一 node 直接读 jev-readiness 缓存文件里的
+#   strict 做一致性比对（不 spawn jev-readiness，避免其 --cached 路径上的工具
+#   探测）。不一致（典型：env/json 刚切换）或缓存缺失时让 gate 不走缓存、按
+#   当前环境实探一次并重写；一致则 gate 直接复用缓存。
+# 外层超时（S-1）：jev-gate commit 30s 封顶；超时按环境型 soft 处理——打
+#   stderr 警告并 exit 0，绝不卡住提交。
+# 依据：spec §5.4、§4.3（两类失败不可混淆）。
+set -uo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+PLUGIN_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+PROJECT_DIR="${PWD:-.}"
+
+# ---------------------------------------------------------------------------
+# 跨平台超时包装（S-1）：优先 timeout（Git for Windows / Linux 自带），
+# 其次 gtimeout（macOS coreutils），都没有则裸执行（保持现状）。
+# JEVZH_HOOK_TIMEOUT（秒）可覆盖默认阈值，仅供宿主自调/测试加速。
+# 用法：run_to <秒> <命令...>；超时返回 124（被 -9 收割时 137）。
+# ---------------------------------------------------------------------------
+JEVZH_TIMEOUT_BIN=""
+if command -v timeout >/dev/null 2>&1; then
+    JEVZH_TIMEOUT_BIN="timeout"
+elif command -v gtimeout >/dev/null 2>&1; then
+    JEVZH_TIMEOUT_BIN="gtimeout"
+fi
+run_to() {
+    local secs="$1"; shift
+    [ -n "${JEVZH_HOOK_TIMEOUT:-}" ] && secs="$JEVZH_HOOK_TIMEOUT"
+    if [ -n "$JEVZH_TIMEOUT_BIN" ]; then
+        "$JEVZH_TIMEOUT_BIN" "$secs" "$@"
+    else
+        "$@"
+    fi
+}
+is_timeout_rc() { [ "$1" = "124" ] || [ "$1" = "137" ]; }
+
+# gate 实际生效的超时秒数（仅用于对外文案；run_to 内部自行解析覆盖）。
+GATE_TIMEOUT_SECS="${JEVZH_HOOK_TIMEOUT:-30}"
+
+# ---------------------------------------------------------------------------
+# stdin 读取（1MB 上限，S-4）：尾部哨兵 X 保证命令替换不吞尾换行、且可精确
+# 计字节；head 读到第 1048577 字节（含哨兵共 1048578）即判定超限。
+# ---------------------------------------------------------------------------
+ENTER_GATE=0
+raw="$(head -c 1048577 2>/dev/null; printf X)"
+nbytes="$(printf '%s' "$raw" | wc -c | tr -d '[:space:]')"
+if [ "${nbytes:-0}" -ge 1048578 ]; then
+    ENTER_GATE=1   # 超过 1MB：不做内容判定，fail-closed
+else
+    input="${raw%X}"
+    if [ -z "$input" ]; then
+        ENTER_GATE=1   # 空 stdin：回落门禁
+    elif printf '%s' "$input" | grep -Eiq 'commit|push'; then
+        # node 语义判定：exit 0=提交/推送命令，1=不是，2=无法判定。
+        parse_rc=0
+        if printf '%s' "$input" | node -e '
+          let s="";
+          process.stdin.on("data", d => s += d);
+          process.stdin.on("end", () => {
+            let j;
+            try { j = JSON.parse(s); } catch (e) { process.exit(2); }
+            if (j === null || typeof j !== "object") process.exit(2);
+            let c;
+            const ti = j.tool_input;
+            if (ti !== undefined && ti !== null && typeof ti === "object"
+                && ti.command !== undefined && ti.command !== null) {
+              c = ti.command;
+            } else {
+              c = j.command;
+            }
+            if (typeof c !== "string") process.exit(2);
+            // I-2：先折叠 shell 反斜杠续行（"\<LF>/\<CRLF>"），否则
+            // `git \<newline> commit` 这一合法单命令会被 [^\n] 挡在门外。
+            c = c.replace(/\\\r?\n[ \t]*/g, " ");
+            // 同行内出现 git（或 git.exe，允许绝对路径前缀）后接 commit/push；
+            // gitx/commit-done 等不会误伤（git 后须为空白/结尾，commit 须词边界）。
+            const re = /git(\.exe)?(\s|$)[^\n]*\b(commit|push)\b/i;
+            process.exit(re.test(c) ? 0 : 1);
+          });
+        ' 2>/dev/null; then
+            ENTER_GATE=1
+        else
+            parse_rc=$?
+            # node 退出 1=明确非提交；其余（2 不可判定 / 127 node 缺失等）进门
+            [ "$parse_rc" = "1" ] || ENTER_GATE=1
+        fi
+    fi
+fi
+[ "$ENTER_GATE" = "1" ] || exit 0
+
+# ---------------------------------------------------------------------------
+# strict 判定（S-2）：纯本地 node 读 JEVZH_STRICT(env 置位优先，0/false/no/off
+#   均可关闭) > .jevzh.json strict；口径与 jev-readiness bool_word 一字不差。
+#   不做任何工具/后端探测；node 异常按 soft（gate 自身另有保守阻断兜底）。
+# 缓存一致性（S-2）：同一个 node 直接读 jev-readiness 的状态缓存文件比对 strict，
+#   不再为读缓存而 spawn jev-readiness——该脚本 --cached 分支之前仍会跑一遍
+#   工具探测（git jev --version 等），等于每提交照探一遍。缓存路径算法与
+#   jev-readiness 完全一致：<tmp 基目录>/jevzh-<sha256(项目绝对路径)>.state。
+#   任何异常（node 缺失/缓存缺失/布局变化）缓存侧输出 x → 判为不一致 → 让
+#   gate 不走缓存、按当前环境实探一次并重写：与旧实现「冷缓存先预热」等价，
+#   最差只是多探一次，绝不会拿旧 strict 错判。
+# ---------------------------------------------------------------------------
+PROJ_ABS="$PROJECT_DIR"
+if abs="$(cd "$PROJECT_DIR" 2>/dev/null && pwd)"; then PROJ_ABS="$abs"; fi
+# node 是 Windows 原生程序，不认 MSYS 的 /tmp 挂载；文件 IO 用 Windows 形态
+# 路径（与 jev-readiness 的 cygpath 归一使用同一张挂载表）。
+TMP_RAW="${TMPDIR:-${TEMP:-${TMP:-/tmp}}}"
+TMP_WIN="$TMP_RAW"
+PROJ_WIN="$PROJ_ABS"
+# Windows/Git Bash 一次 cygpath 同时归一 tmp 基目录与项目目录（node 是原生
+# Windows 程序，不认 MSYS 的 /tmp 挂载）；非 Windows 无 cygpath 时原样使用。
+if command -v cygpath >/dev/null 2>&1; then
+  if win2="$(cygpath -w "$TMP_RAW" "$PROJ_ABS" 2>/dev/null)" && [ -n "$win2" ]; then
+    TMP_WIN="${win2%%$'\n'*}"
+    PROJ_WIN="${win2#*$'\n'}"
+  fi
+fi
+# 输出两行：<本地 strict 0/1>\n<缓存 strict 0/1/x>。
+# 注意两点 Windows/Git Bash 坑：
+#   1) node -e 的用户参数从 process.argv[1] 开始（无脚本路径占位）；
+#   2) MSYS 会自动把 POSIX 形态 argv 转成 Windows 路径，而缓存哈希的输入必须
+#      与 jev-readiness 的 sha256sum 完全一致（MSYS 形态 $PROJ_ABS），故用
+#      MSYS2_ARG_CONV_EXCL='*' 关闭转换；文件 IO 另传 Windows 形态路径。
+STRICT_OUT="$(MSYS2_ARG_CONV_EXCL='*' MSYS_ARG_CONV_EXCL='*' node -e '
+  const fs = require("fs"), crypto = require("crypto"), path = require("path");
+  const [projMsys, tmpWin, projWin] = process.argv.slice(1);
+  const truthy = v => ["1","true","yes","on"].includes(String(v).toLowerCase());
+  let local = "0";
+  if (process.env.JEVZH_STRICT !== undefined) {
+    local = truthy(process.env.JEVZH_STRICT) ? "1" : "0";
+  } else {
+    let js = "";
+    try {
+      const j = JSON.parse(fs.readFileSync(path.join(projWin, ".jevzh.json"), "utf8"));
+      if (j !== null && typeof j === "object"
+          && j.strict !== undefined && j.strict !== null) js = String(j.strict);
+    } catch (e) { /* 配置缺失/损坏：默认 soft */ }
+    local = (js !== "" && truthy(js)) ? "1" : "0";
+  }
+  let cached = "x";
+  try {
+    const h = crypto.createHash("sha256").update(projMsys).digest("hex");
+    const j = JSON.parse(fs.readFileSync(path.join(tmpWin, "jevzh-" + h + ".state"), "utf8"));
+    if (j !== null && typeof j === "object" && typeof j.strict === "boolean") {
+      cached = j.strict ? "1" : "0";
+    }
+  } catch (e) { /* 缓存缺失/不可读/布局变化：x → 让 gate 实探 */ }
+  process.stdout.write(local + "\n" + cached);
+' "$PROJ_ABS" "$TMP_WIN" "$PROJ_WIN" 2>/dev/null || printf '0\nx')"
+STRICT="${STRICT_OUT%%$'\n'*}"
+CACHED_STRICT="${STRICT_OUT#*$'\n'}"
+[ "$STRICT" = "1" ] || STRICT=0
+[ -n "$CACHED_STRICT" ] || CACHED_STRICT=x
+
+if [ "$CACHED_STRICT" = "$STRICT" ]; then
+    GATE_USE_CACHE=1
+else
+    GATE_USE_CACHE=0
+fi
+
+if ! command -v git >/dev/null 2>&1; then
+    if [ "$STRICT" = "1" ]; then
+        echo "pre-commit：未找到 git，严格模式下提交门禁阻断（exit 2）。请先安装 git。" >&2
+        exit 2
+    fi
+    echo "WARN pre-commit：未找到 git，软降级跳过提交门禁（不代表检查通过）。" >&2
+    exit 0
+fi
+
+# 经统一门禁入口执行 git jev check；缓存口径与本轮 strict 一致时复用缓存。
+if [ "$GATE_USE_CACHE" = "1" ]; then
+    export JEVZH_GATE_CACHE=1
+else
+    unset JEVZH_GATE_CACHE
+fi
+GATE_RC=0
+out="$(run_to 30 bash "$PLUGIN_ROOT/scripts/jev-gate" --project "$PROJECT_DIR" commit 2>&1)" || GATE_RC=$?
+printf '%s\n' "$out"
+
+if is_timeout_rc "$GATE_RC"; then
+    echo "WARN pre-commit：jev-gate commit 超时（${GATE_TIMEOUT_SECS}s），本次跳过提交门禁（软降级，不代表检查通过）。" >&2
+    exit 0
+fi
+
+if [ "$GATE_RC" -ne 0 ]; then
+    echo "pre-commit：提交门禁未通过（exit 2），本次 git commit/push 已被阻止；详见上方 jev-gate 输出。" >&2
+    exit 2
+fi
+
+exit 0

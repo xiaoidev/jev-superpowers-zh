@@ -1,0 +1,34 @@
+# 依赖
+node_modules/
+
+# 本地配置与运行时状态（配置模板见 .jevzh.json.example，备份在 .jevzh/backups/）
+.jevzh.json
+.jevzh/
+
+# 安装器在本仓 dogfood 时生成的技能副本（源在 skills/ 目录）
+.claude/
+.cline/
+.clinerules/
+.kilocode/
+.codex/skills/
+.gemini/skills/
+.hermes/skills/
+.opencode/skills/
+.qoder/
+.trae/
+
+# 本地工作树与日志
+.worktrees/
+.private-journal/
+*.log
+
+# 双上游审计的本地检出/导出目录（由 JEVZH_UPSTREAM_ZH/JEVZH_UPSTREAM_JEV 指向）
+upstream/
+
+# Python（serve-laya.py 本地桥运行产物）
+__pycache__/
+*.pyc
+
+# 系统文件
+.DS_Store
+Thumbs.db

@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# scripts/jev-gate — jev-superpowers-zh 统一门禁入口
+#
+# 依据：docs/superpowers/specs/2026-10-03-jev-superpowers-zh-integration-design.md
+#       §4.1 命令/阈值（数值零改动）、§4.3 两类失败不可混淆、§5.3 门禁入口
+#
+# 用法：jev-gate [--project <dir>] <子命令> [透传参数...]
+#   pick             jev-axi pick        confidence >=0.80 通过；0.50-0.80 人工(exit 3)；<0.50 否决
+#   scout            jev-scout           0 候选硬失败 → exit 2
+#   guard            jev-guard           verdict: block 永远人工确认；无法识别保守否决
+#   commit           git jev check       输出含 [PASS] 才通过；FAIL 永不软放行
+#   triage           jev-axi triage      stdin 原样管道；以原生命令退出码为准
+#   check-hypothesis jev-axi check       最大 p > 0.70 通过，否则继续取证
+#   quality          supercov quality    非零 weak/critical 反模式计数 → 否决
+#   limpet           limpet check        退出 0 通过；不依赖后端
+#
+# 环境型失败（工具缺失/后端不可达）：strict exit 2；soft 打印 [门禁降级] 后 exit 0。
+# 判定型失败（门跑了但结论否决）：任何模式 exit 2，不予软放行。
+set -u
+
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+# ---------------------------------------------------------------------------
+# 参数解析：--project 只能出现在子命令之前
+# ---------------------------------------------------------------------------
+PROJECT_ARG=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --project)
+      [ $# -ge 2 ] || { printf 'jev-gate：--project 需要目录参数\n' >&2; exit 64; }
+      PROJECT_ARG="$2"; shift 2 ;;
+    --project=*) PROJECT_ARG="${1#*=}"; shift ;;
+    --) shift; break ;;
+    -*) printf 'jev-gate：未知选项 %s\n' "$1" >&2; exit 64 ;;
+    *) break ;;
+  esac
+done
+
+[ $# -ge 1 ] || {
+  cat >&2 <<'EOF'
+用法：jev-gate [--project <dir>] <子命令> [透传参数...]
+子命令（8）：
+  pick              构思权衡（jev-axi pick，confidence 阈值 0.80 / 0.50）
+  scout             依赖核实（jev-scout，0 候选即门失败）
+  guard             命令安全（jev-guard，block 永远人工确认）
+  commit            提交门禁（git jev check，须输出 [PASS]）
+  triage            失败分诊（jev-axi triage，stdin 管道）
+  check-hypothesis  假设验证（jev-axi check，p > 0.70）
+  quality           质量审计（supercov quality，0 个 weak files）
+  limpet            收束校验（limpet check，不依赖后端）
+EOF
+  exit 64
+}
+SUB="$1"; shift
+
+case "$SUB" in
+  pick|scout|guard|commit|triage|check-hypothesis|quality|limpet) ;;
+  *)
+    printf 'jev-gate：未知子命令「%s」。\n' "$SUB" >&2
+    cat >&2 <<'EOF'
+用法：jev-gate [--project <dir>] <子命令> [透传参数...]
+支持的 8 个子命令：pick、scout、guard、commit、triage、check-hypothesis、quality、limpet。
+EOF
+    exit 64 ;;
+esac
+
+# ---------------------------------------------------------------------------
+# 与 jev-readiness 同口径加载配置/状态
+# ---------------------------------------------------------------------------
+RD_ARGS=(--json)
+[ -n "$PROJECT_ARG" ] && RD_ARGS+=(--project "$PROJECT_ARG")
+[ "${JEVZH_GATE_CACHE:-}" = "1" ] && RD_ARGS+=(--cached)
+
+STATE_JSON="$(bash "$DIR/jev-readiness" "${RD_ARGS[@]}" 2>/dev/null || true)"
+PARSED="$(printf '%s' "$STATE_JSON" | node -e '
+  let s="";
+  process.stdin.on("data", d => s += d);
+  process.stdin.on("end", () => {
+    try {
+      const j = JSON.parse(s);
+      console.log(j.state);
+      console.log(j.backend);
+      console.log(j.strict ? "1" : "0");
+      console.log(Array.isArray(j.missingTools) ? j.missingTools.join(",") : "");
+    } catch (e) { process.exit(1); }
+  });
+' 2>/dev/null)" || {
+  printf 'jev-gate：就绪状态读取失败（jev-readiness 输出不可解析），保守阻断。\n' >&2
+  exit 2
+}
+{ read -r S_STATE; read -r S_BACKEND; read -r S_STRICT; read -r S_MISSING; } <<< "$PARSED"
+
+tool_for() {
+  case "$1" in
+    pick|triage|check-hypothesis) printf 'jev-axi' ;;
+    scout) printf 'jev-scout' ;;
+    guard) printf 'jev-guard' ;;
+    commit) printf 'git-jev' ;;
+    quality) printf 'supercov' ;;
+    limpet) printf 'limpet' ;;
+  esac
+}
+
+skill_for() {
+  case "$1" in
+    pick) printf 'brainstorming' ;;
+    scout) printf 'writing-plans' ;;
+    guard|commit) printf 'executing-plans' ;;
+    triage|check-hypothesis) printf 'systematic-debugging' ;;
+    quality|limpet) printf 'verification-before-completion' ;;
+  esac
+}
+
+install_hint() {
+  case "$1" in
+    jev-scout) printf 'cargo install jev-scout' ;;
+    jev-axi)   printf 'npm install -g jev-axi' ;;
+    git-jev)   printf 'git jev install' ;;
+    jev-guard) printf 'npm install -g jev-guard' ;;
+    supercov)  printf 'npm install -g supercov' ;;
+    limpet)    printf 'cargo install limpet（或 python3 ~/limpet/limpet.py）' ;;
+    *)         printf '-' ;;
+  esac
+}
+
+NEED_TOOL="$(tool_for "$SUB")"
+FALLBACK_SKILL="$(skill_for "$SUB")"
+# limpet 门不要求后端；其余门 heuristic/laya/cloud 均可，none 不可
+NEED_BACKEND=1
+[ "$SUB" = "limpet" ] && NEED_BACKEND=0
+
+TOOL_MISSING=0
+case ",$S_MISSING," in *",$NEED_TOOL,"*) TOOL_MISSING=1 ;; esac
+BACKEND_MISSING=0
+if [ "$NEED_BACKEND" = 1 ] && [ "$S_BACKEND" = "none" ]; then BACKEND_MISSING=1; fi
+
+# ---------------------------------------------------------------------------
+# 环境型失败：strict 阻断 exit 2 / soft 降级 exit 0
+# ---------------------------------------------------------------------------
+if [ "$TOOL_MISSING" = 1 ] || [ "$BACKEND_MISSING" = 1 ]; then
+  DETAILS=""
+  if [ "$TOOL_MISSING" = 1 ]; then
+    DETAILS="  缺失工具：${NEED_TOOL}（安装方式：$(install_hint "$NEED_TOOL")）"$'\n'
+  fi
+  if [ "$BACKEND_MISSING" = 1 ]; then
+    DETAILS="${DETAILS}  后端不可用：本地可运行 scripts/serve-laya.py（heuristic 零依赖可用），云端需设置 TYPESAFE_API_KEY"$'\n'
+  fi
+  if [ "$S_STRICT" = 1 ]; then
+    {
+      printf 'jev-gate %s（严格模式）：运行环境不满足，门禁阻断（exit 2）。\n' "$SUB"
+      printf '%s' "$DETAILS"
+      printf '严格模式下环境型失败不允许软降级；如需软放行，请将 .jevzh.json 的 strict 置为 false 或取消 JEVZH_STRICT。\n'
+    } >&2
+    exit 2
+  fi
+  printf '[门禁降级] jev-gate %s：运行环境不满足，本门跳过（软降级，不阻断；不代表门禁已通过）。\n' "$SUB"
+  printf '%s' "$DETAILS"
+  printf '请转用标准中文技能「%s」继续本阶段流程。\n' "$FALLBACK_SKILL"
+  exit 0
+fi
+
+# ---------------------------------------------------------------------------
+# 执行原生命令（stdout/stderr 原样保留；triage 的 stdin 原样继承管道）
+# ---------------------------------------------------------------------------
+TMPOUT="$(mktemp 2>/dev/null || printf '%s' "/tmp/jev-gate.$$.$RANDOM")"
+trap 'rm -f "$TMPOUT"' EXIT
+NRC=0
+case "$SUB" in
+  pick)             jev-axi pick "$@" ;;
+  scout)            jev-scout "$@" ;;
+  guard)            jev-guard "$@" ;;
+  commit)           git jev check "$@" ;;
+  triage)           jev-axi triage "$@" ;;
+  check-hypothesis) jev-axi check "$@" ;;
+  quality)          supercov quality "$@" ;;
+  limpet)           limpet check "$@" ;;
+esac >"$TMPOUT" 2>&1
+NRC=$?
+cat "$TMPOUT"
+CAPTURED="$(cat "$TMPOUT")"
+
+reject() { # $1=具体原因
+  printf 'jev-gate %s：判定否决，不予软放行（strict/soft 一致，exit 2）。%s\n' "$SUB" "$1" >&2
+  exit 2
+}
+
+# ---------------------------------------------------------------------------
+# 判定解析（阈值忠实 spec §4.1）
+# ---------------------------------------------------------------------------
+case "$SUB" in
+  commit)
+    if [ "$NRC" -ne 0 ]; then reject "git jev check 以退出码 $NRC 失败，且未见可靠通过信号。"; fi
+    if printf '%s' "$CAPTURED" | grep -Fq '[PASS]'; then exit 0; fi
+    reject "输出中未找到 [PASS]，提交门禁不通过。"
+    ;;
+
+  guard)
+    if printf '%s' "$CAPTURED" | grep -Eiq 'verdict:[[:space:]]*block'; then
+      reject "jev-guard 判定 verdict: block，该命令永远需要人工确认，任何模式都不自动执行。"
+    fi
+    # PASS 必须是独立 token（带字母边界）：BYPASSED/password/trespass 等含 pass
+    # 子串的输出不得放行；真实输出「PASS (destructive: 0.01)」仍命中。
+    if printf '%s' "$CAPTURED" | grep -Eq '(^|[^A-Za-z])PASS([^A-Za-z]|$)'; then exit 0; fi
+    reject "无法识别 jev-guard 的判定输出（既无 PASS 也无 verdict: block），保守按否决处理，请人工确认。"
+    ;;
+
+  pick)
+    # 取最后一个 confidence（重跑场景以最后一次为准）；全角冒号兼容。
+    # 单次 node 同时完成 [0,1] 范围校验与分档，输出两行：<值> <档 A/B/C>；
+    # 越界（1.5、-0.2）与不可解析同罪：无输出即否决。
+    PICK_PARSED="$(printf '%s' "$CAPTURED" | node -e '
+      let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+        const vals=[...s.matchAll(/confidence\s*[:：]\s*([0-9]+(?:\.[0-9]+)?)/gi)].map(m=>Number(m[1]));
+        if(!vals.length) return;
+        const c=vals[vals.length-1];
+        if(!Number.isFinite(c)||c<0||c>1) return;
+        process.stdout.write(String(c)+"\n"+(c>=0.80?"A":(c>=0.50?"B":"C")));
+      });')"
+    [ -n "$PICK_PARSED" ] || reject "无法从 jev-axi pick 输出中解析合法 confidence（需 0≤c≤1），输出不可解析，保守否决。"
+    { read -r PICK_VAL; read -r PICK_BAND; } <<< "$PICK_PARSED"
+    case "$PICK_BAND" in
+      A) exit 0 ;;
+      B)
+        printf 'jev-gate pick：confidence=%s 位于 0.50–0.80 人工破平区间（exit 3）：既不自动通过也不否决，请由人类权衡拍板后再继续。\n' "$PICK_VAL"
+        exit 3 ;;
+      C) reject "confidence=$PICK_VAL 低于 0.50，需补充需求/上下文后重新探测，禁止以猜测继续。" ;;
+    esac
+    ;;
+
+  check-hypothesis)
+    HYP_MAX="$(printf '%s' "$CAPTURED" | node -e '
+      let s="";process.stdin.on("data",d=>s+=d).on("end",()=>{
+        const re=/(?:probability|(?:^|[^A-Za-z])p)\s*[:：]\s*([0-9]+(?:\.[0-9]+)?)/gi;
+        const vals=[...s.matchAll(re)].map(m=>Number(m[1]));
+        if(vals.length) process.stdout.write(String(Math.max(...vals)));
+      });')"
+    [ -n "$HYP_MAX" ] || reject "无法从 jev-axi check 输出中解析任何概率值，禁止盲修；请继续取证。"
+    if node -e 'process.exit(Number(process.argv[1])>0.70?0:1)' "$HYP_MAX"; then exit 0; fi
+    reject "最高假设概率 p=$HYP_MAX 未超过 0.70，继续取证，禁止盲修。"
+    ;;
+
+  scout)
+    if [ "$NRC" -ne 0 ]; then reject "jev-scout 以退出码 $NRC 失败。"; fi
+    # 只自动拦截“0 候选/门失败”这类确定硬失败；Fit/Noul 阈值由计划阶段的 agent 按技能约束执行。
+    # 数字 0 必须带前导边界（行首或非数字/非小数点字符），避免 10/20/100 verified crates
+    # 被子串误命中；grep 天然逐行匹配，模式不会跨行。
+    if printf '%s\n' "$CAPTURED" | grep -Eiq \
+      -e '(^|[^0-9.])0[[:space:]]+verified[[:space:]]+crates?' \
+      -e '(^|[^0-9.])0[[:space:]]+matching[[:space:]]+candidates?' \
+      -e '(^|[^0-9.])0[[:space:]]+candidates?([^0-9]|$)' \
+      -e '(^|[^A-Za-z])GATE[[:space:]]*FAILED'; then
+      reject "jev-scout 报告 0 个经核实候选（门失败），禁止凭想象选依赖；请调整需求描述或扩大生态范围后重试。"
+    fi
+    exit 0
+    ;;
+
+  quality)
+    if [ "$NRC" -ne 0 ]; then reject "supercov quality 以退出码 $NRC 失败。"; fi
+    # 按字段名锚定、逐行解析（spec §4.1：0 个 weak files；unhandled_errors /
+    # duplicated_logic 计数 >0 即否决；deep_nesting 数值严格 >0.90 才否决）。
+    # 只取字段名之后紧邻的第一个数字（冒号/等号/空白分隔，40 字符窗口内），
+    # 字段名之前的数字（如 “Scanned 50 files”）一律忽略；不做全局窗口扫描。
+    # q_field_num <行> <字段正则>：命中时输出字段名之后紧邻的数字，未命中返回 1
+    q_field_num() {
+      local qline="$1" qre="^(.*)$2" qtail
+      [[ "$qline" =~ $qre ]] || return 1
+      qtail="${qline:${#BASH_REMATCH[0]}:40}"
+      [[ "$qtail" =~ ^[[:space:]:=]*([0-9]+([.][0-9]+)?) ]] || return 1
+      printf '%s' "${BASH_REMATCH[1]}"
+    }
+    # 浮点比较：q_float_gt <x> <y> → x>y 时返回 0（禁止字符串比较）
+    q_float_gt() { node -e 'process.exit(Number(process.argv[1])>Number(process.argv[2])?0:1)' "$1" "$2" </dev/null; }
+
+    QLINE=""
+    QNUM=""
+    QBAD=0
+    shopt -s nocasematch
+    while IFS= read -r QLINE || [ -n "$QLINE" ]; do
+      # 总结性 critical 标记：同行同时出现 critical 与任一反模式名 → 否决
+      # （覆盖无数字的 “unhandled_errors (critical)” 类输出）
+      if [[ "$QLINE" == *critical* ]] && [[ "$QLINE" =~ unhandled_errors|deep_nesting|duplicated_logic ]]; then
+        QBAD=1; break
+      fi
+      # weak files / unhandled_errors / duplicated_logic：数字 >0 即否决（0 容忍类）。
+      # 四个字段各自独立锚定，避免同行多字段时短路或贪婪匹配漏掉靠前的正计数。
+      if QNUM="$(q_field_num "$QLINE" 'weak[[:space:]]+files?')"; then
+        q_float_gt "$QNUM" 0 && { QBAD=1; break; }
+      fi
+      if QNUM="$(q_field_num "$QLINE" 'unhandled_errors')"; then
+        q_float_gt "$QNUM" 0 && { QBAD=1; break; }
+      fi
+      if QNUM="$(q_field_num "$QLINE" 'duplicated_logic')"; then
+        q_float_gt "$QNUM" 0 && { QBAD=1; break; }
+      fi
+      # deep_nesting：阈值严格 >0.90（0.90 本身通过，0.5/0.05 等小数值不否决）
+      if QNUM="$(q_field_num "$QLINE" 'deep_nesting')"; then
+        q_float_gt "$QNUM" 0.90 && { QBAD=1; break; }
+      fi
+    done <<< "$CAPTURED"
+    shopt -u nocasematch
+    [ "$QBAD" = 1 ] && reject "supercov 报告含非零反模式计数（weak files / critical / unhandled_errors / duplicated_logic 等），先消除根因再谈完成。"
+    exit 0
+    ;;
+
+  limpet)
+    if [ "$NRC" -eq 0 ]; then exit 0; fi
+    reject "limpet check 未证实全部验收标准（退出码 ${NRC}），收束被否决。"
+    ;;
+
+  triage)
+    if [ "$NRC" -eq 0 ]; then exit 0; fi
+    reject "jev-axi triage 以退出码 $NRC 失败。"
+    ;;
+esac

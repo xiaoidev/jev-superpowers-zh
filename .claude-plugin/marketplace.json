@@ -1,0 +1,20 @@
+{
+  "name": "jev-superpowers-zh",
+  "description": "中文 AI 编程方法论 + 6 个 jev 门禁技能，共 27 个 skills，支持 Claude Code / Cursor / Codex CLI 等 26 款工具",
+  "owner": {
+    "name": "jev-superpowers-zh contributors",
+    "url": "https://github.com/xiaoidev"
+  },
+  "plugins": [
+    {
+      "name": "jev-superpowers-zh",
+      "description": "中文 AI 编程方法论（21 个技能）叠加 6 个汉化 jev 门禁技能，共 27 个 skills；门禁默认软降级，支持 Claude Code / Cursor / Codex CLI / Kimi Code 等 26 款工具",
+      "version": "0.1.0",
+      "source": "./",
+      "author": {
+        "name": "jev-superpowers-zh contributors",
+        "url": "https://github.com/xiaoidev"
+      }
+    }
+  ]
+}
